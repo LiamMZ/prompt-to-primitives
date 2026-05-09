@@ -38,6 +38,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from dotenv import load_dotenv
+load_dotenv(_REPO_ROOT / ".env")
+
 from ptp.utils.logging_utils import configure_logging, get_structured_logger
 from ptp.camera import CameraIntrinsics, REALSENSE_AVAILABLE
 from ptp.perception.molmo_point_detector import MolmoPointDetector
@@ -197,20 +200,66 @@ def _load_from_disk(rgb_path: str, depth_path: str) -> Tuple[np.ndarray, np.ndar
 # Individual query runners — each returns a result dict or None
 # ---------------------------------------------------------------------------
 
+def _run_surface_query(
+    query_type: str,
+    detector: MolmoPointDetector,
+    color: np.ndarray,
+    depth: np.ndarray,
+    intrinsics: CameraIntrinsics,
+    object_type: str,
+    action_goal: Optional[str],
+) -> Optional[dict]:
+    """Shared implementation for push / pull / push-pull surface queries."""
+    prompt = build_prompt(query_type.replace("-", "_"), object_type, action_goal=action_goal)
+    logger.info("=== %s  (goal: %s) ===", query_type.upper(), action_goal or "generic")
+    logger.info("Prompt: %s", prompt)
+    results = detector.get_interaction_points(
+        rgb_image=color, depth_frame=depth, camera_intrinsics=intrinsics,
+        object_id=f"{object_type}_0", object_type=object_type,
+        bounding_box_2d=None, actions={"_surface"},
+        custom_prompts={"_surface": prompt},
+    )
+    ip = results.get("_surface")
+    if ip is None:
+        logger.warning("%s: no surface point returned", query_type)
+        return None
+    h, w = color.shape[:2]
+    x_px, y_px = _ip_to_px(ip, h, w)
+    normal_cam, confidence = _normal_for_ip(ip, depth, intrinsics, h, w)
+    logger.info("%s: pixel=(%.1f, %.1f)  3d=%s", query_type, x_px, y_px,
+                [f"{v:.3f}" for v in ip.position_3d] if ip.position_3d is not None else "N/A")
+    if normal_cam is not None:
+        logger.info("%s: normal=[%.3f, %.3f, %.3f]  confidence=%.2f  push_dir=[%.3f, %.3f, %.3f]",
+                    query_type,
+                    normal_cam[0], normal_cam[1], normal_cam[2], confidence,
+                    -normal_cam[0], -normal_cam[1], -normal_cam[2])
+    else:
+        logger.warning("%s: surface normal estimation failed", query_type)
+    label = f"{query_type}" + (f" ({action_goal})" if action_goal else "")
+    return {"query": query_type, "ip": ip, "x_px": x_px, "y_px": y_px,
+            "label": label, "color": _QUERY_COLORS.get(query_type, _QUERY_COLORS["push"]),
+            "normal_cam": normal_cam, "normal_confidence": confidence,
+            "prompt": prompt}
+
+
 def query_grasp(
     detector: MolmoPointDetector,
     color: np.ndarray,
     depth: np.ndarray,
     intrinsics: CameraIntrinsics,
     object_type: str,
+    action_goal: Optional[str] = None,
 ) -> Optional[dict]:
-    logger.info("=== GRASP interaction point ===")
+    prompt = build_prompt("grasp", object_type, action_goal=action_goal)
+    logger.info("=== GRASP  (goal: %s) ===", action_goal or "generic")
+    logger.info("Prompt: %s", prompt)
     results = detector.get_interaction_points(
         rgb_image=color, depth_frame=depth, camera_intrinsics=intrinsics,
         object_id=f"{object_type}_0", object_type=object_type,
-        bounding_box_2d=None, actions={"pick"},
+        bounding_box_2d=None, actions={"_grasp"},
+        custom_prompts={"_grasp": prompt},
     )
-    ip = results.get("pick")
+    ip = results.get("_grasp")
     if ip is None:
         logger.warning("grasp: no point returned")
         return None
@@ -218,116 +267,21 @@ def query_grasp(
     x_px, y_px = _ip_to_px(ip, h, w)
     logger.info("grasp: pixel=(%.1f, %.1f)  3d=%s", x_px, y_px,
                 [f"{v:.3f}" for v in ip.position_3d] if ip.position_3d is not None else "N/A")
+    label = "grasp" + (f" ({action_goal})" if action_goal else "")
     return {"query": "grasp", "ip": ip, "x_px": x_px, "y_px": y_px,
-            "label": "grasp", "color": _QUERY_COLORS["grasp"]}
+            "label": label, "color": _QUERY_COLORS["grasp"], "prompt": prompt}
 
 
-def query_push(
-    detector: MolmoPointDetector,
-    color: np.ndarray,
-    depth: np.ndarray,
-    intrinsics: CameraIntrinsics,
-    object_type: str,
-) -> Optional[dict]:
-    logger.info("=== PUSH surface contact + normal ===")
-    prompt = f"Point to the surface of the {object_type} where I should push against it."
-    results = detector.get_interaction_points(
-        rgb_image=color, depth_frame=depth, camera_intrinsics=intrinsics,
-        object_id=f"{object_type}_0", object_type=object_type,
-        bounding_box_2d=None, actions={"_surface"},
-        custom_prompts={"_surface": prompt},
-    )
-    ip = results.get("_surface")
-    if ip is None:
-        logger.warning("push: no surface point returned")
-        return None
-    h, w = color.shape[:2]
-    x_px, y_px = _ip_to_px(ip, h, w)
-    normal_cam, confidence = _normal_for_ip(ip, depth, intrinsics, h, w)
-    logger.info("push: pixel=(%.1f, %.1f)  3d=%s", x_px, y_px,
-                [f"{v:.3f}" for v in ip.position_3d] if ip.position_3d is not None else "N/A")
-    if normal_cam is not None:
-        logger.info("push: normal=[%.3f, %.3f, %.3f]  confidence=%.2f",
-                    normal_cam[0], normal_cam[1], normal_cam[2], confidence)
-    else:
-        logger.warning("push: surface normal estimation failed")
-    return {"query": "push", "ip": ip, "x_px": x_px, "y_px": y_px,
-            "label": "push surface", "color": _QUERY_COLORS["push"],
-            "normal_cam": normal_cam, "normal_confidence": confidence}
+def query_push(detector, color, depth, intrinsics, object_type, action_goal=None):
+    return _run_surface_query("push", detector, color, depth, intrinsics, object_type, action_goal)
 
 
-def query_pull(
-    detector: MolmoPointDetector,
-    color: np.ndarray,
-    depth: np.ndarray,
-    intrinsics: CameraIntrinsics,
-    object_type: str,
-) -> Optional[dict]:
-    logger.info("=== PULL surface contact + normal ===")
-    prompt = f"Point to the surface of the {object_type} where I should pull from it."
-    results = detector.get_interaction_points(
-        rgb_image=color, depth_frame=depth, camera_intrinsics=intrinsics,
-        object_id=f"{object_type}_0", object_type=object_type,
-        bounding_box_2d=None, actions={"_surface"},
-        custom_prompts={"_surface": prompt},
-    )
-    ip = results.get("_surface")
-    if ip is None:
-        logger.warning("pull: no surface point returned")
-        return None
-    h, w = color.shape[:2]
-    x_px, y_px = _ip_to_px(ip, h, w)
-    normal_cam, confidence = _normal_for_ip(ip, depth, intrinsics, h, w)
-    logger.info("pull: pixel=(%.1f, %.1f)  3d=%s", x_px, y_px,
-                [f"{v:.3f}" for v in ip.position_3d] if ip.position_3d is not None else "N/A")
-    if normal_cam is not None:
-        logger.info("pull: normal=[%.3f, %.3f, %.3f]  confidence=%.2f",
-                    normal_cam[0], normal_cam[1], normal_cam[2], confidence)
-    else:
-        logger.warning("pull: surface normal estimation failed")
-    return {"query": "pull", "ip": ip, "x_px": x_px, "y_px": y_px,
-            "label": "pull surface", "color": _QUERY_COLORS["pull"],
-            "normal_cam": normal_cam, "normal_confidence": confidence}
+def query_pull(detector, color, depth, intrinsics, object_type, action_goal=None):
+    return _run_surface_query("pull", detector, color, depth, intrinsics, object_type, action_goal)
 
 
-def query_push_pull(
-    detector: MolmoPointDetector,
-    color: np.ndarray,
-    depth: np.ndarray,
-    intrinsics: CameraIntrinsics,
-    object_type: str,
-) -> Optional[dict]:
-    """Single Molmo call asking for the push/pull contact surface — mirrors executor pipeline."""
-    logger.info("=== PUSH-PULL surface contact + normal (executor pipeline) ===")
-    prompt = (
-        f"Point to the surface of the {object_type} where I should "
-        f"push or pull against it."
-    )
-    results = detector.get_interaction_points(
-        rgb_image=color, depth_frame=depth, camera_intrinsics=intrinsics,
-        object_id=f"{object_type}_0", object_type=object_type,
-        bounding_box_2d=None, actions={"_surface"},
-        custom_prompts={"_surface": prompt},
-    )
-    ip = results.get("_surface")
-    if ip is None:
-        logger.warning("push-pull: no surface point returned")
-        return None
-    h, w = color.shape[:2]
-    x_px, y_px = _ip_to_px(ip, h, w)
-    normal_cam, confidence = _normal_for_ip(ip, depth, intrinsics, h, w)
-    logger.info("push-pull: pixel=(%.1f, %.1f)  3d=%s", x_px, y_px,
-                [f"{v:.3f}" for v in ip.position_3d] if ip.position_3d is not None else "N/A")
-    if normal_cam is not None:
-        logger.info("push-pull: normal=[%.3f, %.3f, %.3f]  confidence=%.2f  "
-                    "push direction (negated)=[%.3f, %.3f, %.3f]",
-                    normal_cam[0], normal_cam[1], normal_cam[2], confidence,
-                    -normal_cam[0], -normal_cam[1], -normal_cam[2])
-    else:
-        logger.warning("push-pull: surface normal estimation failed")
-    return {"query": "push-pull", "ip": ip, "x_px": x_px, "y_px": y_px,
-            "label": "push/pull surface", "color": _QUERY_COLORS["push-pull"],
-            "normal_cam": normal_cam, "normal_confidence": confidence}
+def query_push_pull(detector, color, depth, intrinsics, object_type, action_goal=None):
+    return _run_surface_query("push-pull", detector, color, depth, intrinsics, object_type, action_goal)
 
 
 def query_hinge(
@@ -336,10 +290,12 @@ def query_hinge(
     depth: np.ndarray,
     intrinsics: CameraIntrinsics,
     object_type: str,
-    hinge_location: str,
+    hinge_location: Optional[str],
+    action_goal: Optional[str] = None,
 ) -> Optional[dict]:
-    logger.info("=== HINGE / PIVOT point ===")
-    prompt = f"Point to the hinge or pivot point of the {hinge_location}."
+    prompt = build_hinge_prompt(object_type, hinge_location=hinge_location, action_goal=action_goal)
+    logger.info("=== HINGE  (goal: %s) ===", action_goal or "generic")
+    logger.info("Prompt: %s", prompt)
     results = detector.get_interaction_points(
         rgb_image=color, depth_frame=depth, camera_intrinsics=intrinsics,
         object_id=f"{object_type}_0", object_type=object_type,
@@ -355,7 +311,7 @@ def query_hinge(
     logger.info("hinge: pixel=(%.1f, %.1f)  3d=%s", x_px, y_px,
                 [f"{v:.3f}" for v in ip.position_3d] if ip.position_3d is not None else "N/A")
     return {"query": "hinge", "ip": ip, "x_px": x_px, "y_px": y_px,
-            "label": "hinge", "color": _QUERY_COLORS["hinge"]}
+            "label": "hinge", "color": _QUERY_COLORS["hinge"], "prompt": prompt}
 
 
 def query_push_aside(
@@ -364,14 +320,18 @@ def query_push_aside(
     depth: np.ndarray,
     intrinsics: CameraIntrinsics,
     object_type: str,
+    action_goal: Optional[str] = None,
 ) -> Optional[dict]:
-    logger.info("=== PUSH-ASIDE surface ===")
+    prompt = build_prompt("push_aside", object_type, action_goal=action_goal)
+    logger.info("=== PUSH-ASIDE  (goal: %s) ===", action_goal or "generic")
+    logger.info("Prompt: %s", prompt)
     results = detector.get_interaction_points(
         rgb_image=color, depth_frame=depth, camera_intrinsics=intrinsics,
         object_id=f"{object_type}_0", object_type=object_type,
-        bounding_box_2d=None, actions={"push-aside"},
+        bounding_box_2d=None, actions={"_aside"},
+        custom_prompts={"_aside": prompt},
     )
-    ip = results.get("push-aside")
+    ip = results.get("_aside")
     if ip is None:
         logger.warning("push-aside: no point returned")
         return None
@@ -380,7 +340,7 @@ def query_push_aside(
     logger.info("push-aside: pixel=(%.1f, %.1f)  3d=%s", x_px, y_px,
                 [f"{v:.3f}" for v in ip.position_3d] if ip.position_3d is not None else "N/A")
     return {"query": "push-aside", "ip": ip, "x_px": x_px, "y_px": y_px,
-            "label": "push aside", "color": _QUERY_COLORS["push-aside"]}
+            "label": "push aside", "color": _QUERY_COLORS["push-aside"], "prompt": prompt}
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +444,10 @@ def _parse_args() -> argparse.Namespace:
                    choices=ALL_QUERIES, metavar="QUERY",
                    help=f"Which queries to run. Choices: {', '.join(ALL_QUERIES)}. "
                         "Default: all.")
+    p.add_argument("--action-goal", default=None,
+                   help="High-level goal the primitive serves, e.g. 'open', 'close', 'press', "
+                        "'slide', 'unscrew'. Selects a semantically precise prompt. "
+                        "Examples: --object-type 'bottle cap' --action-goal 'open'")
     p.add_argument("--hinge-location", default=None,
                    help="Description of the hinge for the 'hinge' query, e.g. "
                         "'left edge of the drawer'. Required when 'hinge' is in --queries.")
@@ -562,40 +526,43 @@ def main() -> None:
     r_pull_or_pushpull: Optional[dict] = None  # for pivot radius calculation
     r_hinge: Optional[dict] = None
 
+    goal = args.action_goal
+
     for query in args.queries:
         r: Optional[dict] = None
 
         if query == "grasp":
-            r = query_grasp(detector, color, depth, intrinsics, object_type)
+            r = query_grasp(detector, color, depth, intrinsics, object_type, action_goal=goal)
             if r:
                 _save(_visualise(raw_bgr, r), output_dir, "01_grasp")
 
         elif query == "push":
-            r = query_push(detector, color, depth, intrinsics, object_type)
+            r = query_push(detector, color, depth, intrinsics, object_type, action_goal=goal)
             if r:
                 _save(_visualise(raw_bgr, r), output_dir, "02_push_surface")
 
         elif query == "pull":
-            r = query_pull(detector, color, depth, intrinsics, object_type)
+            r = query_pull(detector, color, depth, intrinsics, object_type, action_goal=goal)
             if r:
                 _save(_visualise(raw_bgr, r), output_dir, "03_pull_surface")
                 r_pull_or_pushpull = r
 
         elif query == "push-pull":
-            r = query_push_pull(detector, color, depth, intrinsics, object_type)
+            r = query_push_pull(detector, color, depth, intrinsics, object_type, action_goal=goal)
             if r:
                 _save(_visualise(raw_bgr, r), output_dir, "04_push_pull_surface")
                 r_pull_or_pushpull = r
 
         elif query == "hinge":
-            hinge_desc = args.hinge_location or f"hinge of the {object_type}"
-            r = query_hinge(detector, color, depth, intrinsics, object_type, hinge_desc)
+            hinge_desc = args.hinge_location or None
+            r = query_hinge(detector, color, depth, intrinsics, object_type,
+                            hinge_location=hinge_desc, action_goal=goal)
             r_hinge = r
             if r:
                 _save(_visualise(raw_bgr, r), output_dir, "05_hinge")
 
         elif query == "push-aside":
-            r = query_push_aside(detector, color, depth, intrinsics, object_type)
+            r = query_push_aside(detector, color, depth, intrinsics, object_type, action_goal=goal)
             if r:
                 _save(_visualise(raw_bgr, r), output_dir, "06_push_aside")
 
@@ -619,6 +586,7 @@ def main() -> None:
     summary_lines = [
         "=== Molmo pointing summary ===",
         f"  Object      : {object_type}",
+        f"  Action goal : {goal or '(none)'}",
         f"  Image size  : {img_w}x{img_h}",
         f"  Intrinsics  : fx={intrinsics.fx:.1f} fy={intrinsics.fy:.1f} "
         f"cx={intrinsics.cx:.1f} cy={intrinsics.cy:.1f}",
@@ -644,6 +612,8 @@ def main() -> None:
             f"  [{r['query']:12s}]  pixel=({r['x_px']:.1f}, {r['y_px']:.1f})"
             f"  3d={pos3d_str}{normal_str}"
         )
+        if r.get("prompt"):
+            summary_lines.append(f"    prompt: {r['prompt']}")
 
     if pivot_radius is not None:
         summary_lines.append(f"  Pivot radius: {pivot_radius:.3f}m (XY-plane)")

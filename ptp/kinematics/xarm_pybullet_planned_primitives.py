@@ -58,6 +58,20 @@ class XArmPybulletPlannedPrimitives:
         self._last_execution_error: Optional[str] = None
         self._use_gui = use_gui
 
+        # Read home position from the robot at startup so retract_gripper
+        # returns to wherever the arm actually started, not a hardcoded pose.
+        live = self._get_real_joint_state()
+        if live is not None:
+            self._home_joints: List[float] = live.tolist()
+            self._logger.info("Home joints read from robot: %s",
+                              [f"{v:.3f}" for v in self._home_joints])
+        else:
+            self._home_joints = _HOME_JOINTS
+            self._logger.warning(
+                "Could not read robot joint state at init — using hardcoded home: %s",
+                [f"{v:.3f}" for v in self._home_joints],
+            )
+
     def camera_pose_from_joints(self, joints: Optional[List[float]]):
         """Return `(position, Rotation)` camera pose from PyBullet FK.
 
@@ -709,7 +723,7 @@ class XArmPybulletPlannedPrimitives:
     def twist(
         self,
         direction: str = "clockwise",
-        rotation_angle_deg: float = 90.0,
+        rotation_angle_deg: float = 360.0,
         speed: float = _DEFAULT_SAFE_JOINT_SPEED,
         execute: bool = True,
         **_kwargs: Any,
@@ -720,7 +734,7 @@ class XArmPybulletPlannedPrimitives:
             return {"success": False, "reason": "cannot read real robot joints"}
         joints = np.asarray(joints, dtype=float).copy()
         delta = math.radians(float(rotation_angle_deg))
-        if direction == "clockwise":
+        if direction == "counterclockwise":
             delta *= -1.0
         joints[-1] += delta
         if execute and not self._set_real_joint_angles(joints.tolist(), wait=True, speed=speed):
@@ -748,10 +762,10 @@ class XArmPybulletPlannedPrimitives:
         execute: bool = True,
         **_kwargs: Any,
     ) -> Dict[str, Any]:
-        """Move the real xArm back to the configured home joint state."""
-        if execute and not self._set_real_joint_angles(_HOME_JOINTS, wait=True, speed=speed):
+        """Move the real xArm back to the home joint state captured at startup."""
+        if execute and not self._set_real_joint_angles(self._home_joints, wait=True, speed=speed):
             return {"success": False, "reason": "real robot retract command failed"}
-        self._planner.set_current_joint_state(_HOME_JOINTS)
+        self._planner.set_current_joint_state(self._home_joints)
         return {"success": True, "executed": execute}
 
     def _cartesian_delta_motion(

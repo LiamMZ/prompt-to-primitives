@@ -535,7 +535,7 @@ class DepthEnvironmentCollider:
             logger.debug("DepthEnvironmentCollider: mesh failed for %s", label)
             return False
 
-        body_id = self._mesh_to_pybullet(mesh)
+        body_id = self._mesh_to_pybullet(mesh, label=label)
         if body_id is None:
             return False
 
@@ -614,24 +614,50 @@ class DepthEnvironmentCollider:
 
         return mesh
 
-    def _mesh_to_pybullet(self, mesh) -> Optional[int]:
+    # RGBA colours cycled per object label for GUI visibility.
+    _LABEL_COLOURS = [
+        (1.0, 0.3, 0.3, 0.6),   # red
+        (0.3, 1.0, 0.3, 0.6),   # green
+        (0.3, 0.6, 1.0, 0.6),   # blue
+        (1.0, 0.8, 0.2, 0.6),   # yellow
+        (0.8, 0.3, 1.0, 0.6),   # purple
+        (0.2, 0.9, 0.9, 0.6),   # cyan
+    ]
+    _BACKGROUND_COLOUR = (0.7, 0.7, 0.7, 0.35)
+    _label_counter: int = 0
+
+    def _mesh_to_pybullet(self, mesh, label: str = "") -> Optional[int]:
         verts = np.asarray(mesh.vertices, dtype=np.float64)
         tris = np.asarray(mesh.triangles, dtype=np.int32)
         if len(verts) == 0 or len(tris) == 0:
             return None
+        client = self._planner._physics_client
         try:
             col_id = p.createCollisionShape(
                 p.GEOM_MESH,
                 vertices=verts.tolist(),
                 indices=tris.flatten().tolist(),
-                physicsClientId=self._planner._physics_client,
+                physicsClientId=client,
+            )
+            if label == BACKGROUND_ID:
+                rgba = self._BACKGROUND_COLOUR
+            else:
+                rgba = self._LABEL_COLOURS[self._label_counter % len(self._LABEL_COLOURS)]
+                self._label_counter += 1
+            vis_id = p.createVisualShape(
+                p.GEOM_MESH,
+                vertices=verts.tolist(),
+                indices=tris.flatten().tolist(),
+                rgbaColor=rgba,
+                physicsClientId=client,
             )
             return p.createMultiBody(
                 baseMass=0,
                 baseCollisionShapeIndex=col_id,
+                baseVisualShapeIndex=vis_id,
                 basePosition=[0, 0, 0],
                 baseOrientation=[0, 0, 0, 1],
-                physicsClientId=self._planner._physics_client,
+                physicsClientId=client,
             )
         except Exception as exc:
             logger.warning("DepthEnvironmentCollider: pybullet mesh creation failed: %s", exc)

@@ -149,9 +149,9 @@ _PUSH_ASIDE_TEMPLATES: dict[str | None, str] = {
 # ---------------------------------------------------------------------------
 
 _HINGE_TEMPLATES: dict[str | None, str] = {
-    None:   "Point to the hinge or pivot axis of the {object_type}.",
-    "open": "Point to the hinge or pivot axis the {object_type} rotates around when opened.",
-    "close": "Point to the hinge or pivot axis the {object_type} rotates around when closed.",
+    None:   "Point to the hinge or pivot axis of the {object_type}. It may not be visible — point to your best guess of where it would be located.",
+    "open": "Point to the hinge or pivot axis the {object_type} rotates around when opened. It may not be visible — point to your best guess of where it would be located.",
+    "close": "Point to the hinge or pivot axis the {object_type} rotates around when closed. It may not be visible — point to your best guess of where it would be located.",
 }
 
 

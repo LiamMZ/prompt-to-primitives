@@ -53,7 +53,7 @@ PRIMITIVE_LIBRARY: Dict[str, PrimitiveSchema] = {
             "force_direction",
             "is_button",
             "has_pivot",
-            "hinge_location",
+            "action_goal",
             "speed_factor",
             "execute",
             "metadata",
@@ -65,8 +65,7 @@ PRIMITIVE_LIBRARY: Dict[str, PrimitiveSchema] = {
             "surface_label: name of the surface/object to interact with. "
             "force_direction: 'perpendicular' (into surface) or 'parallel' (slide). "
             "is_button: True for momentary press-and-retract. "
-            "has_pivot: True for revolute (door/drawer) articulation. "
-            "hinge_location: surface boundary label for the hinge axis. "
+            "has_pivot: True for revolute (door/drawer) articulation — Molmo locates the hinge automatically. "
             "metadata: executor-injected dict containing surface_normal_base (set by "
             "Molmo surface grounding), surface_normal_confidence, surface_pixel_yx; "
             "and for pivot motions: pivot_point_base (Molmo-grounded hinge 3D position "
@@ -107,15 +106,15 @@ PRIMITIVE_LIBRARY: Dict[str, PrimitiveSchema] = {
     # ------------------------------------------------------------------
     "twist": PrimitiveSchema(
         name="twist",
-        optional_params=("direction", "rotation_angle_deg", "speed_factor", "timeout"),
+        optional_params=("direction", "turn_amount", "speed_factor", "timeout"),
         allowed_frames=("base", "camera"),
         description=(
             "Rotate the wrist/final joint. "
             "direction: 'clockwise' or 'counterclockwise'. "
-            "rotation_angle_deg: degrees to rotate (default 90)."
+            "turn_amount: 'quarter_turn' (90°), 'half_turn' (180°), "
+            "'three_quarter_turn' (270°), or 'full_turn' (360°). Default: full_turn."
         ),
         param_validators={
-            "rotation_angle_deg": _positive_number_validator("rotation_angle_deg"),
             "speed_factor": _positive_number_validator("speed_factor"),
             "timeout": _positive_number_validator("timeout"),
         },

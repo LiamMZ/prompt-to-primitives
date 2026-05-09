@@ -19,10 +19,11 @@ from scipy.spatial.transform import Rotation
 
 from ptp.perception.utils.coordinates import compute_3d_position
 from ptp.perception.surface_normal import compute_surface_normal, transform_normal_to_base
-from ptp.primitives.types import PrimitiveCall, SkillPlan
+from ptp.perception.pointing_prompts import build_prompt, build_hinge_prompt
+from ptp.primitives.types import SkillPlan
 from ptp.primitives.library import PRIMITIVE_LIBRARY
-from ptp.primitives.snapshot_utils import SnapshotArtifacts, SnapshotCache, load_snapshot_artifacts
-from ptp.utils.logging_utils import get_structured_logger
+from ptp.primitives.snapshot_utils import SnapshotCache, load_snapshot_artifacts
+from ptp.utils.logging_utils import get_structured_logger, RunTimer
 from ptp.grasp.grasp_planner import GraspPlanner
 
 
@@ -51,6 +52,7 @@ class PrimitiveExecutionResult:
     executed: bool
     primitive_results: List[Any] = field(default_factory=list)
     executed_primitives: List[ExecutedPrimitive] = field(default_factory=list)
+    timings: Dict[str, float] = field(default_factory=dict)
 
 
 class PrimitiveExecutor:
@@ -62,12 +64,16 @@ class PrimitiveExecutor:
         perception_pool_dir: Path,
         logger: Optional[logging.Logger] = None,
         orchestrator: Optional[Any] = None,
+        molmo: Optional[Any] = None,
+        masks: Optional[Dict[str, Any]] = None,
     ):
         self.primitives = primitives
         self.perception_pool_dir = Path(perception_pool_dir)
         self._snapshot_cache = SnapshotCache()
         self.logger = logger or get_structured_logger("PrimitiveExecutor")
         self.orchestrator = orchestrator
+        self._molmo = molmo
+        self._masks: Dict[str, Any] = masks or {}
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -80,10 +86,18 @@ class PrimitiveExecutor:
     ) -> PrimitiveExecutionResult:
         """Translate (and optionally execute) a primitive plan."""
         self.logger.info("Executing plan: %s", plan)
-        translated_plan = self.prepare_plan(plan, world_state)
+        timer = RunTimer()
+
+        with timer.measure("prepare_plan"):
+            translated_plan = self.prepare_plan(plan, world_state)
+        # propagate per-primitive grounding timings recorded during prepare_plan
+        for k, v in getattr(translated_plan, "_grounding_timings", {}).items():
+            timer.record(k, v)
+
         if dry_run:
             self.logger.info("Dry run requested; execution skipped.")
-            return PrimitiveExecutionResult(executed=False)
+            timer.log_summary(self.logger)
+            return PrimitiveExecutionResult(executed=False, timings=timer.to_dict())
         if self.primitives is None:
             raise RuntimeError("Primitives interface is required for execution (dry_run=False).")
 
@@ -106,6 +120,16 @@ class PrimitiveExecutor:
             # Inject references.object_id as a kwarg so move_gripper_to_pose can build
             # ignore_labels and mask the target object out of collision checking.
             call_params = dict(primitive.parameters)
+            # Translate discrete turn_amount labels to rotation_angle_deg for twist.
+            if primitive.name == "twist" and "turn_amount" in call_params:
+                _TURN_DEGREES = {
+                    "quarter_turn": 90.0,
+                    "half_turn": 180.0,
+                    "three_quarter_turn": 270.0,
+                    "full_turn": 360.0,
+                }
+                turn_label = call_params.pop("turn_amount")
+                call_params["rotation_angle_deg"] = _TURN_DEGREES.get(turn_label, 360.0)
             ref_obj_id = primitive.references.get("object_id")
             if ref_obj_id:
                 call_params.setdefault("object_id", ref_obj_id)
@@ -116,7 +140,8 @@ class PrimitiveExecutor:
             self.logger.debug("Calling '%s' with parameters: %s", primitive.name, call_params)
             success = True
             try:
-                raw_result = method(**call_params)
+                with timer.measure(f"execute.{primitive.name}[{idx}]"):
+                    raw_result = method(**call_params)
             except Exception as exc:
                 success = False
                 raw_result = str(exc)
@@ -151,10 +176,12 @@ class PrimitiveExecutor:
             else:
                 break
 
+        timer.log_summary(self.logger)
         return PrimitiveExecutionResult(
             executed=True,
             primitive_results=primitive_results,
             executed_primitives=executed_primitives,
+            timings=timer.to_dict(),
         )
 
     def prepare_plan(
@@ -193,17 +220,26 @@ class PrimitiveExecutor:
             self.logger.info("[prepare_plan] No primitives interface; skipping base-frame transform")
 
         # Ground any deferred pointing_guidance via Molmo before coordinate translation.
+        _grounding_timings: Dict[str, float] = {}
         for idx, primitive in enumerate(plan.primitives):
             if primitive.name == "move_gripper_to_pose" and primitive.metadata.get("pointing_guidance"):
+                _t0 = time.perf_counter()
                 self._resolve_pointing_guidance(primitive, artifacts, plan, idx)
+                _grounding_timings[f"molmo_grounding.move_gripper_to_pose[{idx}]"] = round(
+                    time.perf_counter() - _t0, 4
+                )
 
         # For push_pull: run Molmo on the surface_label to get an interaction
         # point, then compute the surface normal at that point from depth.
-        # The normal is stored in primitive.metadata["surface_normal_base"] and
-        # passed through to the primitives interface.
         for idx, primitive in enumerate(plan.primitives):
             if primitive.name == "push_pull":
+                _t0 = time.perf_counter()
                 self._resolve_push_pull_surface(primitive, artifacts, cam_pose, plan, idx)
+                _grounding_timings[f"molmo_grounding.push_pull[{idx}]"] = round(
+                    time.perf_counter() - _t0, 4
+                )
+
+        plan._grounding_timings = _grounding_timings  # type: ignore[attr-defined]
 
         # Translate each primitive (pixel → 3D, camera → base frame).
         for idx, primitive in enumerate(plan.primitives):
@@ -342,8 +378,8 @@ class PrimitiveExecutor:
         if object_id is None or artifacts.depth is None or artifacts.intrinsics is None:
             return None
 
-        masks: Dict[str, Any] = {}
-        if self.orchestrator is not None:
+        masks: Dict[str, Any] = dict(self._masks)
+        if not masks and self.orchestrator is not None:
             tracker = getattr(self.orchestrator, "tracker", None)
             raw = getattr(tracker, "_last_masks", None) or {}
             if not raw:
@@ -379,7 +415,22 @@ class PrimitiveExecutor:
 
         cam_pos: Optional[np.ndarray] = None
         cam_rot: Optional[Rotation] = None
-        if self.orchestrator is not None:
+
+        # Try primitives interface first (syncs from real robot if joints not provided).
+        if self.primitives is not None:
+            helper = getattr(self.primitives, "camera_pose_from_joints", None)
+            if helper is None:
+                helper = getattr(self.primitives, "get_camera_transform", None)
+            if helper is not None:
+                try:
+                    joints = (artifacts.robot_state or {}).get("joints")
+                    result = helper(joints) if joints is not None else helper(None)
+                    if result and result[0] is not None:
+                        cam_pos, cam_rot = result
+                except Exception:
+                    pass
+
+        if cam_pos is None or cam_rot is None and self.orchestrator is not None:
             robot = getattr(getattr(self.orchestrator, "config", None), "robot", None)
             if robot is not None:
                 try:
@@ -388,16 +439,11 @@ class PrimitiveExecutor:
                     pass
 
         if cam_pos is None or cam_rot is None:
-            joints = (artifacts.robot_state or {}).get("joints")
-            if self.primitives and joints is not None:
-                helper = getattr(self.primitives, "camera_pose_from_joints", None)
-                if helper:
-                    try:
-                        cam_pos, cam_rot = helper(joints)
-                    except Exception:
-                        pass
-
-        if cam_pos is None or cam_rot is None:
+            self.logger.warning(
+                "_get_object_point_cloud: camera transform unavailable for %r — "
+                "returning camera-frame cloud (base-frame grasp planning will be wrong)",
+                object_id,
+            )
             return pts_cam.astype(np.float32)
 
         pts_world = cam_rot.apply(pts_cam) + cam_pos
@@ -432,13 +478,13 @@ class PrimitiveExecutor:
         from PIL import Image as _PIL
 
         surface_label: str = primitive.parameters.get("surface_label", "")
-        hinge_location: str = primitive.parameters.get("hinge_location", "") or ""
         has_pivot: bool = bool(primitive.parameters.get("has_pivot", False))
+        action_goal: Optional[str] = primitive.parameters.get("action_goal") or None
         ref_id = primitive.references.get("object_id") or surface_label
 
         # ---- 1. locate Molmo detector ----
-        detector = None
-        if self.orchestrator is not None:
+        detector = self._molmo
+        if detector is None and self.orchestrator is not None:
             tracker = getattr(self.orchestrator, "tracker", None)
             detector = getattr(tracker, "_molmo", None)
             if detector is None:
@@ -463,21 +509,20 @@ class PrimitiveExecutor:
             h, w = rgb.shape[:2]
 
             # ---- 2a. Molmo: point at the push/pull surface contact point ----
-            surface_prompt = (
-                f"Point to the surface of the {surface_label} where I should "
-                f"push or pull against it."
-            )
+            surface_prompt = build_prompt("push_pull", surface_label, action_goal=action_goal)
             actions = {"_surface"}
             custom_prompts = {"_surface": surface_prompt}
 
             # ---- 2b. Molmo: point at the hinge location (pivot only) ----
             if has_pivot:
-                hinge_hint = hinge_location or f"hinge of the {surface_label}"
-                hinge_prompt = (
-                    f"Point to the hinge or pivot point of the {hinge_hint}."
+                hinge_prompt = build_hinge_prompt(
+                    surface_label,
+                    action_goal=action_goal,
                 )
                 actions.add("_hinge")
                 custom_prompts["_hinge"] = hinge_prompt
+
+            object_mask = self._masks.get(ref_id) if ref_id else None
 
             results = detector.get_interaction_points(
                 rgb_image=rgb,
@@ -489,6 +534,7 @@ class PrimitiveExecutor:
                 actions=actions,
                 robot_state=artifacts.robot_state,
                 custom_prompts=custom_prompts,
+                object_mask=object_mask,
             )
 
             ip_surface = results.get("_surface")
@@ -549,6 +595,8 @@ class PrimitiveExecutor:
             primitive.metadata["surface_normal_base"] = normal_base.tolist()
             primitive.metadata["surface_normal_confidence"] = float(confidence)
             primitive.metadata["surface_pixel_yx"] = [px_row, px_col]
+            # Normalised position_2d for run output annotation (same key as move_gripper_to_pose)
+            primitive.metadata["position_2d"] = list(ip_surface.position_2d)
 
             # ---- 6. Hinge grounding (pivot_pull only) ----
             if has_pivot:
@@ -687,12 +735,18 @@ class PrimitiveExecutor:
         import io
         from PIL import Image as _PIL
 
-        guidance: str = primitive.metadata.get("pointing_guidance", "")
+        _guidance_raw: str = primitive.metadata.get("pointing_guidance", "").strip()
+        # Molmo is trained on "Point to X" instructions; prepend if not already present.
+        _lower = _guidance_raw.lower()
+        if _guidance_raw and not (_lower.startswith("point to") or _lower.startswith("point at")):
+            guidance = "Point to " + _guidance_raw
+        else:
+            guidance = _guidance_raw
         approach_dir: str = primitive.metadata.get("approach_direction", "from_clearance")
         ref_id = primitive.references.get("object_id")
 
-        detector = None
-        if self.orchestrator is not None:
+        detector = self._molmo
+        if detector is None and self.orchestrator is not None:
             tracker = getattr(self.orchestrator, "tracker", None)
             detector = getattr(tracker, "_molmo", None)
             if detector is None:
@@ -730,9 +784,12 @@ class PrimitiveExecutor:
                         obj_type = getattr(live_obj, "object_type", "object") or "object"
                         clearance_profile = getattr(live_obj, "clearance_profile", None)
 
+            object_mask = self._masks.get(ref_id) if ref_id else None
+
             self.logger.info(
-                "[prepare_plan] [%d] Running Molmo for pointing_guidance=%r on %s",
+                "[prepare_plan] [%d] Running Molmo for pointing_guidance=%r on %s%s",
                 step_idx, guidance, ref_id or "__guidance__",
+                " (masked)" if object_mask is not None else "",
             )
             results = detector.get_interaction_points(
                 rgb_image=rgb,
@@ -745,6 +802,7 @@ class PrimitiveExecutor:
                 robot_state=robot_state,
                 custom_prompts={"_guided": guidance},
                 clearance_profile=clearance_profile,
+                object_mask=object_mask,
             )
 
             ip = results.get("_guided")
@@ -752,7 +810,64 @@ class PrimitiveExecutor:
                 raise ValueError("Molmo returned no point for guidance prompt")
 
             if ip.position_3d is not None:
-                primitive.parameters["target_position"] = np.asarray(ip.position_3d, dtype=float).tolist()
+                pos_3d = np.asarray(ip.position_3d, dtype=float)
+
+                # Molmo's _transform_cam_to_world requires robot_state["camera"] to be
+                # present.  If the snapshot robot_state lacked that key (e.g. dry-run),
+                # position_3d is still in camera frame — apply the transform now.
+                cam_key_present = bool(
+                    (artifacts.robot_state or {}).get("camera")
+                )
+                if not cam_key_present and self.primitives is not None:
+                    helper = getattr(self.primitives, "camera_pose_from_joints", None)
+                    if helper is None:
+                        helper = getattr(self.primitives, "get_camera_transform", None)
+                    if helper is not None:
+                        try:
+                            snap_joints = (artifacts.robot_state or {}).get("joints")
+                            self.logger.info(
+                                "[prepare_plan] [%d] cam→base transform: "
+                                "joints_rad=%s  joints_deg=%s",
+                                step_idx,
+                                [round(j, 4) for j in snap_joints] if snap_joints else None,
+                                [round(np.degrees(j), 2) for j in snap_joints] if snap_joints else None,
+                            )
+                            cam_pos_w, cam_rot_w = helper(snap_joints)
+                            if cam_pos_w is not None and cam_rot_w is not None:
+                                self.logger.info(
+                                    "[prepare_plan] [%d] cam→base transform: "
+                                    "cam_pos=%s  cam_quat_xyzw=%s  pt_cam=%s",
+                                    step_idx,
+                                    [round(v, 4) for v in cam_pos_w.tolist()],
+                                    [round(v, 4) for v in cam_rot_w.as_quat().tolist()],
+                                    [round(v, 4) for v in pos_3d.tolist()],
+                                )
+                                pos_3d = cam_rot_w.apply(pos_3d) + cam_pos_w
+                                self.logger.info(
+                                    "[prepare_plan] [%d] cam→base result: pt_base=%s",
+                                    step_idx, [round(v, 4) for v in pos_3d.tolist()],
+                                )
+                        except Exception as tf_exc:
+                            self.logger.warning(
+                                "[prepare_plan] [%d] fallback cam→base transform failed: %s",
+                                step_idx, tf_exc,
+                            )
+                elif cam_key_present:
+                    rs = artifacts.robot_state or {}
+                    cam_tf = rs.get("camera", {})
+                    snap_joints = rs.get("joints")
+                    self.logger.info(
+                        "[prepare_plan] [%d] cam→base (from snapshot robot_state): "
+                        "joints_rad=%s  joints_deg=%s  cam_pos=%s  cam_quat_xyzw=%s  pt_base=%s",
+                        step_idx,
+                        [round(j, 4) for j in snap_joints] if snap_joints else None,
+                        [round(np.degrees(j), 2) for j in snap_joints] if snap_joints else None,
+                        cam_tf.get("position"),
+                        cam_tf.get("quaternion_xyzw"),
+                        [round(v, 4) for v in pos_3d.tolist()],
+                    )
+
+                primitive.parameters["target_position"] = pos_3d.tolist()
                 primitive.parameters.pop("point_label", None)
 
             preference = "top_down" if approach_dir != "side" else "side"
@@ -767,6 +882,9 @@ class PrimitiveExecutor:
             primitive.metadata["molmo_position_3d"] = (
                 np.asarray(ip.position_3d).tolist() if ip.position_3d is not None else None
             )
+            # Store 2D pixel location for run output annotation
+            if ip.position_2d is not None:
+                primitive.metadata["position_2d"] = list(ip.position_2d)
             self.logger.info(
                 "[prepare_plan] [%d] Molmo grounded target_position=%s orientation=%s",
                 step_idx, primitive.parameters.get("target_position"), orientation,

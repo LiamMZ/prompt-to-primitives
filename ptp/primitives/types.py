@@ -180,6 +180,7 @@ class SkillPlan:
     diagnostics: SkillPlanDiagnostics = field(default_factory=SkillPlanDiagnostics)
     registry_hash: Optional[str] = None
     source_snapshot_id: Optional[str] = None
+    raw_llm_response: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -188,6 +189,7 @@ class SkillPlan:
             "diagnostics": self.diagnostics.to_dict(),
             "registry_hash": self.registry_hash,
             "source_snapshot_id": self.source_snapshot_id,
+            "raw_llm_response": self.raw_llm_response,
         }
 
     @classmethod

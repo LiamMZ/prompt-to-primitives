@@ -180,6 +180,66 @@ def configure_logging(
         root.addHandler(ch)
 
 
+class RunTimer:
+    """Lightweight wall-clock timer for named stages.
+
+    Usage::
+
+        t = RunTimer()
+        with t.measure("model_load.molmo"):
+            load_molmo()
+        t.log_summary(logger)
+        timings = t.to_dict()   # JSON-serialisable
+    """
+
+    def __init__(self) -> None:
+        import time as _time
+        self._time = _time
+        self._records: list = []   # list of (name, elapsed_s)
+        self._stack:  list = []    # (name, t0) for nested contexts
+
+    class _Context:
+        def __init__(self, timer: "RunTimer", name: str) -> None:
+            self._timer = timer
+            self._name  = name
+        def __enter__(self) -> "RunTimer._Context":
+            self._timer._stack.append((self._name, self._timer._time.perf_counter()))
+            return self
+        def __exit__(self, *_: object) -> None:
+            name, t0 = self._timer._stack.pop()
+            self._timer._records.append((name, self._timer._time.perf_counter() - t0))
+
+    def measure(self, name: str) -> "_Context":
+        """Context manager: ``with timer.measure("stage"): ...``"""
+        return self._Context(self, name)
+
+    def record(self, name: str, elapsed_s: float) -> None:
+        """Manually record a pre-measured duration."""
+        self._records.append((name, elapsed_s))
+
+    def elapsed(self, name: str) -> float:
+        """Sum of all records matching name (0.0 if none)."""
+        return sum(e for n, e in self._records if n == name)
+
+    def to_dict(self) -> dict:
+        """Return {name: elapsed_s} with summed duplicates, JSON-serialisable."""
+        out: dict = {}
+        for name, elapsed in self._records:
+            out[name] = round(out.get(name, 0.0) + elapsed, 4)
+        return out
+
+    def log_summary(self, logger: logging.Logger, level: int = logging.INFO) -> None:
+        """Log all timings as a formatted table."""
+        if not self._records:
+            return
+        totals = self.to_dict()
+        width = max(len(k) for k in totals)
+        lines = ["Timing summary:"]
+        for name, elapsed in totals.items():
+            lines.append(f"  {name:<{width}}  {elapsed:7.3f}s")
+        logger.log(level, "\n".join(lines))
+
+
 def get_structured_logger(name: str) -> logging.Logger:
     """Return a named child logger that propagates to the root handler.
 

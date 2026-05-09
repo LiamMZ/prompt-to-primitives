@@ -59,7 +59,8 @@ def _make_action_prompt(action: str, object_type: str) -> str:
     query_type, goal = _ACTION_GOAL_MAP.get(action, ("grasp", None))
     return _build_prompt(query_type, object_type, action_goal=goal)
 
-_MODEL_CHECKPOINT = "allenai/Molmo2-4B"
+import os as _os
+_MODEL_CHECKPOINT = _os.environ.get("MOLMO_CHECKPOINT", "allenai/Molmo2-4B")
 
 # Molmo2 output format: <points coords="<frame> <x> <y>; ..."/>
 # coords are in [0, 1000] scale; frame id is 1-indexed float.
@@ -135,6 +136,8 @@ class MolmoPointDetector:
         if self._model is not None:
             return
 
+        import time as _time
+        _t0_total = _time.perf_counter()
         self.logger.info("Loading Molmo2-4B from '%s'…", self._checkpoint)
         import torch
         from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
@@ -168,14 +171,19 @@ class MolmoPointDetector:
             load_kwargs["dtype"] = "auto"
 
         try:
+            _t0 = _time.perf_counter()
             self._model = AutoModelForImageTextToText.from_pretrained(
                 self._checkpoint, **load_kwargs
             )
+            _model_load_s = _time.perf_counter() - _t0
+
+            _t0 = _time.perf_counter()
             self._processor = AutoProcessor.from_pretrained(
                 self._checkpoint,
                 trust_remote_code=True,
                 use_fast=True,
             )
+            _processor_load_s = _time.perf_counter() - _t0
         except Exception:
             self._model = None
             self._processor = None
@@ -185,7 +193,12 @@ class MolmoPointDetector:
             (p.device for p in self._model.parameters() if p.device.type == "cuda"),
             torch.device("cpu"),
         )
-        self.logger.info("Molmo2-4B loaded on %s (8-bit).", self._exec_device)
+        _total_s = _time.perf_counter() - _t0_total
+        self.logger.info(
+            "Molmo2-4B loaded on %s — model=%.1fs  processor=%.1fs  total=%.1fs",
+            self._exec_device, _model_load_s, _processor_load_s, _total_s,
+        )
+        self.load_time_s = _total_s
 
     # ------------------------------------------------------------------
     # Public API
@@ -203,6 +216,7 @@ class MolmoPointDetector:
         robot_state: Optional[Dict[str, Any]] = None,
         custom_prompts: Optional[Dict[str, str]] = None,
         clearance_profile: Optional[Any] = None,
+        object_mask: Optional[np.ndarray] = None,
     ) -> Dict[str, InteractionPoint]:
         """
         Return a Dict[action → InteractionPoint] for a single detected object.
@@ -222,6 +236,9 @@ class MolmoPointDetector:
             clearance_profile: Optional ClearanceProfile for the object.  When provided,
                 approach_orientation and approach_vector are computed from
                 clearance_profile.best_approach_dirs() and stored on each InteractionPoint.
+            object_mask: Boolean HxW mask for the target object from GSAM2.  When
+                provided, pixels outside the mask are darkened to black before the
+                image is sent to Molmo, removing distracting context.
 
         Returns:
             Dict mapping each queried action to its InteractionPoint, or an
@@ -232,6 +249,25 @@ class MolmoPointDetector:
         actions = actions or DEFAULT_ACTIONS
         custom_prompts = custom_prompts or {}
         h, w = rgb_image.shape[:2]
+
+        # Apply object mask: darken everything outside the target object so
+        # Molmo focuses only on the relevant region.
+        if object_mask is not None:
+            mask = object_mask
+            if mask.shape != (h, w):
+                from PIL import Image as _PILr
+                mask = np.array(
+                    _PILr.fromarray(mask.astype(np.uint8) * 255).resize(
+                        (w, h), _PILr.NEAREST
+                    )
+                ).astype(bool)
+            masked_rgb = rgb_image.copy()
+            masked_rgb[~mask] = 0
+            rgb_image = masked_rgb
+            if depth_frame is not None:
+                masked_depth = depth_frame.copy()
+                masked_depth[~mask] = 0.0
+                depth_frame = masked_depth
 
         # Determine crop region. bounding_box_2d is [y1, x1, y2, x2] in 0-1000
         # normalized scale (same as position_2d); convert to pixels before slicing.

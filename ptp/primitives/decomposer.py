@@ -172,6 +172,7 @@ class SkillDecomposer:
 
         plan = self._parse_plan(raw, action_name=action_name, registry_hash=registry_hash)
         plan.source_snapshot_id = artifacts.snapshot_id
+        plan.raw_llm_response = raw
         self._post_process_plan(plan, world_state, artifacts)
         return plan
 
@@ -369,6 +370,9 @@ class SkillDecomposer:
         self, response_text: str, action_name: str, registry_hash: Optional[str]
     ) -> SkillPlan:
         data = json.loads(response_text)
+        # Some models wrap the response in a JSON Schema envelope; unwrap it.
+        if data.get("type") == "object" and "properties" in data and "primitives" not in data:
+            data = data["properties"]
         diagnostics_block = data.get("diagnostics") or {}
         plan = SkillPlan(
             action_name=action_name,
@@ -401,23 +405,6 @@ class SkillDecomposer:
                 plan.diagnostics.warnings.append(
                     f"[{idx}] reference object '{ref_id}' not found in registry"
                 )
-                continue
-            ip_label = prim.references.get("interaction_point")
-            if ref_id and ip_label:
-                det = det_map.get(ref_id, {})
-                ip  = (det.get("interaction_points") or {}).get(ip_label)
-                if not ip:
-                    plan.diagnostics.warnings.append(
-                        f"[{idx}] missing interaction point '{ip_label}' on {ref_id}"
-                    )
-                else:
-                    prim.metadata.setdefault("resolved_interaction_point", ip)
-            if ref_id and ref_id in indexed:
-                det = det_map.get(ref_id, {})
-                if not (det.get("interaction_points") or {}):
-                    plan.diagnostics.warnings.append(
-                        f"[{idx}] object '{ref_id}' has no interaction points in snapshot"
-                    )
 
         # Defer Molmo grounding to executor; set point_label fallback now.
         for idx, prim in enumerate(plan.primitives):

@@ -96,27 +96,40 @@ class IncrementalObjectTracker:
     def __init__(
         self,
         grounding_model_id="IDEA-Research/grounding-dino-tiny",
-        sam2_model_cfg="configs/sam2.1/sam2.1_hiera_l.yaml",
-        sam2_ckpt_path="./checkpoints/sam2.1_hiera_large.pt",
+        sam2_model_cfg=os.environ.get("SAM2_CFG", "configs/sam2.1/sam2.1_hiera_b+.yaml"),
+        sam2_ckpt_path=os.environ.get("SAM2_CKPT", "./checkpoints/sam2.1_hiera_base_plus.pt"),
         device="cuda",
         prompt_text="car.",
         detection_interval=20,
         score_threshold=0.5,
         overlap_iou_threshold=0.5,
     ):
+        import time as _time
         self.device = device
         self.detection_interval = detection_interval
         self.prompt_text = prompt_text
         self.score_threshold = score_threshold
         self.overlap_iou_threshold = overlap_iou_threshold
 
+        _t0_total = _time.perf_counter()
+        _t0 = _time.perf_counter()
         self.grounding_predictor = GroundingDinoPredictor(model_id=grounding_model_id, device=device)
+        _grounding_load_s = _time.perf_counter() - _t0
+
+        _t0 = _time.perf_counter()
         self.sam2_segmentor = SAM2ImageSegmentor(
             sam_model_cfg=sam2_model_cfg,
             sam_model_ckpt=sam2_ckpt_path,
             device=device,
         )
         self.video_predictor = build_sam2_video_predictor(sam2_model_cfg, sam2_ckpt_path)
+        _sam2_load_s = _time.perf_counter() - _t0
+        self.load_time_s = _time.perf_counter() - _t0_total
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "GSAM2 models loaded — grounding_dino=%.1fs  sam2=%.1fs  total=%.1fs",
+            _grounding_load_s, _sam2_load_s, self.load_time_s,
+        )
 
         self.inference_state = self._make_inference_state()
         self.inference_state["images"] = torch.empty((0, 3, 1024, 1024), device=device)
