@@ -105,8 +105,12 @@ class GraspPlanner:
         approach  = seed_rot.apply(np.array([0.0, 0.0, 1.0]))
         approach  = approach / (np.linalg.norm(approach) + 1e-9)
 
-        # Build orthonormal frame perpendicular to approach.
-        u, v = self._perp_frame(approach)
+        # Build orthonormal frame perpendicular to approach, anchored to the
+        # seed's jaw axis (X) so that angle=0 matches the seed orientation.
+        # This ensures the sampler explores rotations around the correct starting
+        # orientation rather than an arbitrary perpendicular frame.
+        seed_jaw = seed_rot.apply(np.array([1.0, 0.0, 0.0]))
+        u, v = self._perp_frame_from_seed(approach, seed_jaw)
 
         floor_clearance_z = floor_z + finger_thickness_m
         half_width        = gripper_width_m / 2.0
@@ -173,6 +177,21 @@ class GraspPlanner:
             hint = np.array([1.0, 0.0, 0.0])
         u = np.cross(approach, hint)
         u /= np.linalg.norm(u) + 1e-9
+        v = np.cross(approach, u)
+        v /= np.linalg.norm(v) + 1e-9
+        return u, v
+
+    @staticmethod
+    def _perp_frame_from_seed(approach: np.ndarray, seed_jaw: np.ndarray):
+        """Build orthonormal frame perpendicular to approach, with u aligned to
+        seed_jaw so that angle=0 in the sampler matches the seed orientation."""
+        # Project seed_jaw onto the plane perpendicular to approach.
+        u = seed_jaw - np.dot(seed_jaw, approach) * approach
+        norm_u = np.linalg.norm(u)
+        if norm_u < 1e-6:
+            # seed_jaw is parallel to approach — fall back to arbitrary frame.
+            return GraspPlanner._perp_frame(approach)
+        u /= norm_u
         v = np.cross(approach, u)
         v /= np.linalg.norm(v) + 1e-9
         return u, v

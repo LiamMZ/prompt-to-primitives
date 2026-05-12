@@ -38,6 +38,7 @@ class XArmPybulletInterface(BasePybulletInterface):
         tcp_link_name: str = _TCP_LINK,
         static_camera_tf: Optional[Any] = None,
         use_gui: bool = False,
+        floor_z: float = -0.04,
     ) -> None:
         self._gripper_angle = _GRIPPER_OPEN_ANGLE
         super().__init__(
@@ -48,6 +49,7 @@ class XArmPybulletInterface(BasePybulletInterface):
             n_arm_joints=_N_ARM_JOINTS,
             static_camera_tf=static_camera_tf,
             use_gui=use_gui,
+            floor_z=floor_z,
         )
         self._initialize_gripper_pose()
 

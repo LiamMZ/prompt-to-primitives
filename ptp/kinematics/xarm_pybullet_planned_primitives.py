@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+from ptp.kinematics.gripper_orientations import preset_quat
 from ptp.kinematics.xarm_pybullet_interface import XArmPybulletInterface
 from ptp.utils.logging_utils import get_structured_logger
 
@@ -23,6 +24,14 @@ _DEFAULT_ORIENTATION_TOLERANCE_RAD = 0.6
 _DEFAULT_SAFE_SPEED_FACTOR = 0.5
 _DEFAULT_SAFE_JOINT_SPEED = 0.5
 _DEFAULT_SAFE_JOINT_ACCEL = 0.25
+
+
+def _normalise_vec(v: Optional[Any]) -> Optional[np.ndarray]:
+    if v is None:
+        return None
+    arr = np.asarray(v, dtype=float)
+    n = float(np.linalg.norm(arr))
+    return arr / n if n > 1e-6 else None
 
 
 class XArmPybulletPlannedPrimitives:
@@ -326,7 +335,7 @@ class XArmPybulletPlannedPrimitives:
         use_side = (preset_orientation == "side") or is_side_grasp
         seed_name = "side" if use_side else "top_down"
         if target_orientation is None:
-            target_orientation = [-0.6894, 0.0305, -0.7237, 0.0033] if use_side else [-0.9983, 0.0314, 0.0438, 0.0223]
+            target_orientation = preset_quat(seed_name)
 
         current_joints = self._planner.get_robot_joint_state()
         current_tcp = self._planner.get_robot_tcp_pose()
@@ -475,20 +484,29 @@ class XArmPybulletPlannedPrimitives:
     def pivot_pull(
         self,
         pivot_point: Optional[List[float]] = None,
-        pull_distance: float = 0.10,
-        arc_angle_deg: float = 25.0,
-        direction: str = "counterclockwise",
-        speed_factor: float = _DEFAULT_SAFE_SPEED_FACTOR,
+        arc_angle_deg: float = 90.0,
+        segments: int = 18,
+        speed_mm_s: float = 30.0,
         execute: bool = True,
         metadata: Optional[Dict[str, Any]] = None,
         **_kwargs: Any,
     ) -> Dict[str, Any]:
-        """Approximate pivot-pull by planning a tangential/radial TCP motion.
+        """Execute an arc motion around a hinge point via direct Cartesian waypoints.
 
-        When ``metadata`` contains ``pivot_point_base`` (Molmo-grounded hinge)
-        and/or ``pivot_radius_m`` (Molmo-derived lever-arm distance), those
-        values override the fallback TCP-offset heuristics.
+        The TCP traces a true circular arc centred on the hinge, with the gripper
+        orientation updated at each step to keep it pointing toward the pivot.
+        Waypoints are streamed with wait=False on intermediate steps for smooth
+        continuous motion (no controller resets between steps).
+
+        Rotation direction is derived geometrically: the positive rotation around
+        the hinge axis that moves the TCP away from the surface (pull) is chosen
+        automatically; no hardcoded hinge-location overrides needed.
+
+        Falls back to a single straight-line cartesian move when no robot adapter
+        supports cartesian_arc (e.g. simulation).
         """
+        from scipy.spatial.transform import Rotation
+
         if not self._sync_planner_to_real_robot():
             return {"success": False, "reason": "cannot read real robot joint state"}
         tcp = self._planner.get_robot_tcp_pose()
@@ -498,207 +516,257 @@ class XArmPybulletPlannedPrimitives:
 
         _meta = metadata or {}
 
-        # Prefer Molmo-grounded pivot point from executor metadata.
+        # ── Resolve pivot point ────────────────────────────────────────────────
         if pivot_point is None:
             meta_pivot = _meta.get("pivot_point_base")
-            if meta_pivot is not None:
-                pivot_point = list(meta_pivot)
-            else:
-                pivot_point = (tcp_pos + np.array([0.0, -0.10, 0.0])).tolist()
+            pivot_point = list(meta_pivot) if meta_pivot is not None else (
+                tcp_pos + np.array([0.0, -0.10, 0.0])
+            ).tolist()
 
         pivot = np.asarray(pivot_point, dtype=float)
-        radius_vec = tcp_pos - pivot
-        radius_xy = radius_vec.copy()
-        radius_xy[2] = 0.0
-        radius_norm = float(np.linalg.norm(radius_xy))
-
-        # Use Molmo-derived lever-arm distance when available (more accurate than
-        # TCP-to-hinge distance, which depends on grasp placement).
-        meta_radius = _meta.get("pivot_radius_m")
-        if meta_radius is not None and float(meta_radius) > 1e-4:
-            arc_radius = float(meta_radius)
-            self._logger.info(
-                "pivot_pull: using Molmo-derived lever-arm radius=%.3fm (TCP-to-pivot=%.3fm)",
-                arc_radius, radius_norm,
-            )
-        else:
-            arc_radius = radius_norm
-
-        if arc_radius < 1e-6:
-            return {"success": False, "reason": "pivot radius too small"}
-
-        if radius_norm < 1e-6:
-            # Pivot coincides with TCP — derive radial direction from world X.
-            radial_hat = np.array([1.0, 0.0, 0.0], dtype=float)
-        else:
-            radial_hat = radius_xy / radius_norm
-
-        tangent_hat = np.array([-radial_hat[1], radial_hat[0], 0.0], dtype=float)
-        if direction == "clockwise":
-            tangent_hat *= -1.0
-        arc_len = math.radians(float(arc_angle_deg)) * arc_radius
-        delta = tangent_hat * arc_len - radial_hat * float(pull_distance)
-        ignore_labels = self._displaceable_ignore_labels()
-        if ignore_labels:
-            self._logger.info("pivot_pull: ignoring displaceable meshes %s", sorted(ignore_labels))
         self._logger.info(
-            "pivot_pull: pivot=%s arc_radius=%.3fm arc_len=%.3fm pull_distance=%.3fm direction=%s",
+            "pivot_pull: tcp_pos=%s  pivot=%s  lever=%.3fm  surface_normal=%s",
+            [f"{v:.3f}" for v in tcp_pos],
             [f"{v:.3f}" for v in pivot],
-            arc_radius, arc_len, pull_distance, direction,
-        )
-        return self._plan_and_execute_pose(
-            target_position=(tcp_pos + delta).tolist(),
-            target_orientation=tcp_quat.tolist(),
-            label="pivot_pull",
-            speed_factor=speed_factor,
-            execute=execute,
-            ignore_labels=ignore_labels,
+            float(np.linalg.norm(tcp_pos - pivot)),
+            [f"{v:.3f}" for v in _meta["surface_normal_base"]] if _meta.get("surface_normal_base") is not None else None,
         )
 
-    def push_pull(
+        # ── Derive hinge rotation axis ─────────────────────────────────────────
+        # The hinge axis is perpendicular to both the lever arm (pivot→TCP) and
+        # the surface normal.  When no normal is available, default to world Z
+        # (vertical hinge — most common for cabinet doors).
+        lever = tcp_pos - pivot
+        lever_norm = float(np.linalg.norm(lever))
+        if lever_norm < 1e-4:
+            return {"success": False, "reason": "TCP coincides with pivot point"}
+
+        surface_normal = _normalise_vec(_meta.get("surface_normal_base"))
+        if surface_normal is not None:
+            hinge_axis = np.cross(lever, surface_normal)
+            hinge_axis_norm = float(np.linalg.norm(hinge_axis))
+            if hinge_axis_norm < 1e-4:
+                # lever and normal are parallel — fall back to world Z
+                hinge_axis = np.array([0.0, 0.0, 1.0])
+            else:
+                hinge_axis = hinge_axis / hinge_axis_norm
+        else:
+            hinge_axis = np.array([0.0, 0.0, 1.0])
+
+        # ── Choose rotation sign ───────────────────────────────────────────────
+        # Try +angle first: if it moves the TCP away from the surface (dot product
+        # with INTO-surface normal < 0) use it; otherwise negate.
+        # Convention: +normal points INTO the surface (camera faces outward), so
+        # moving away from the surface means dot(delta, normal) < 0.
+        test_rot = Rotation.from_rotvec(hinge_axis * math.radians(5.0))
+        test_pos = pivot + test_rot.apply(lever)
+        if surface_normal is not None:
+            sign = 1.0 if float(np.dot(test_pos - tcp_pos, surface_normal)) < 0 else -1.0
+        else:
+            # No normal — pick the direction that decreases X (pull away from wall)
+            sign = 1.0 if test_pos[0] < tcp_pos[0] else -1.0
+
+        arc_rad = math.radians(float(arc_angle_deg)) * sign
+
+        self._logger.info(
+            "pivot_pull: hinge_axis=%s  sign=%+.0f  arc=%.1f°  segments=%d  speed=%.0fmm/s  "
+            "test_delta_dot_normal=%.3f",
+            [f"{v:.3f}" for v in hinge_axis],
+            sign,
+            arc_angle_deg * sign,
+            segments,
+            speed_mm_s,
+            float(np.dot(test_pos - tcp_pos, surface_normal)) if surface_normal is not None else float("nan"),
+        )
+
+        # ── Generate arc waypoints ─────────────────────────────────────────────
+        waypoints: List[tuple] = []
+        tcp_rot = Rotation.from_quat(tcp_quat)
+        for i in range(1, segments + 1):
+            t = i / segments
+            rot = Rotation.from_rotvec(hinge_axis * arc_rad * t)
+            pos = pivot + rot.apply(lever)
+            # Rotate the gripper orientation by the same amount so it stays
+            # tangent to the arc (pointing toward/away from the hinge).
+            quat = (rot * tcp_rot).as_quat()  # xyzw
+            waypoints.append((pos.tolist(), quat.tolist()))
+
+        self._logger.info(
+            "pivot_pull: %d waypoints generated  start=%s  end=%s",
+            len(waypoints),
+            [f"{v:.3f}" for v in waypoints[0][0]] if waypoints else "—",
+            [f"{v:.3f}" for v in waypoints[-1][0]] if waypoints else "—",
+        )
+        for i, (pos, quat) in enumerate(waypoints):
+            self._logger.info(
+                "  wp[%02d/%02d]  pos=[%s]  quat(xyzw)=[%s]",
+                i + 1, len(waypoints),
+                ", ".join(f"{v:.4f}" for v in pos),
+                ", ".join(f"{v:.4f}" for v in quat),
+            )
+
+        if not execute:
+            return {
+                "success": True,
+                "executed": False,
+                "waypoints": [(p, q) for p, q in waypoints],
+                "arc_angle_deg": arc_angle_deg,
+            }
+
+        cartesian_arc = getattr(self._robot, "cartesian_arc", None)
+        if cartesian_arc is None:
+            return {"success": False, "reason": "robot adapter does not support cartesian_arc"}
+
+        ok = cartesian_arc(waypoints, speed=speed_mm_s)
+        return {
+            "success": ok,
+            "executed": True,
+            "arc_angle_deg": arc_angle_deg,
+            "segments": segments,
+            "final_position": waypoints[-1][0] if waypoints else None,
+        }
+
+    def push(
         self,
-        surface_label: str,
-        force_direction: str = "perpendicular",
+        surface_label: str = "",
         is_button: bool = False,
-        has_pivot: bool = False,
-        hinge_location: Optional[str] = None,
+        action_goal: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Compatibility primitive that dispatches to push, pull, or pivot-pull.
+        """Move the gripper into a surface along the negative surface normal.
 
-        If ``metadata`` contains ``surface_normal_base`` (a (3,) array set by
-        the executor's Molmo surface-grounding pipeline), that vector is used
-        directly as the push/pull direction, overriding ``force_direction``.
-
-        force_direction semantics (used when no surface_normal_base is present):
-          "perpendicular" — press into the surface (down for table objects); button press/release
-          "parallel"      — slide laterally across the surface toward the object, computed from
-                            the object's position relative to the current TCP
-          anything else   — treated as a named base-frame axis passed directly to push()
+        When ``metadata`` contains ``surface_normal_base`` (injected by the
+        executor's Molmo grounding pipeline), the gripper moves along -normal.
+        Falls back to pressing straight down if the normal is unavailable.
         """
-        del hinge_location
+        del action_goal
         metadata = metadata or {}
+        normal_base = _normalise_vec(metadata.get("surface_normal_base"))
+        dist = 0.05 if is_button else 0.08
+        self._logger.info(
+            "push: surface=%s  surface_normal_base=%s  confidence=%.2f  is_button=%s",
+            surface_label,
+            [f"{v:.3f}" for v in metadata["surface_normal_base"]] if metadata.get("surface_normal_base") is not None else None,
+            metadata.get("surface_normal_confidence", 0.0),
+            is_button,
+        )
 
-        # Surface-normal direction takes priority when available.
-        normal_base = metadata.get("surface_normal_base")
         if normal_base is not None:
-            normal_base = np.asarray(normal_base, dtype=float)
-            norm = float(np.linalg.norm(normal_base))
-            if norm > 1e-6:
-                normal_base = normal_base / norm
-            else:
-                normal_base = None
+            move_dir = normal_base  # +normal points into the surface (camera faces outward)
+            confidence = metadata.get("surface_normal_confidence", 0.0)
+            self._logger.info(
+                "push: surface=%s  dir=+normal=[%.2f,%.2f,%.2f]  confidence=%.2f  distance=%.3fm%s",
+                surface_label, move_dir[0], move_dir[1], move_dir[2],
+                confidence, dist, "  (button)" if is_button else "",
+            )
+            result = self._cartesian_delta_motion_direct(
+                direction=move_dir,
+                distance=dist,
+                label=f"push ({surface_label})",
+                execute=kwargs.get("execute", True),
+            )
+        else:
+            self._logger.info(
+                "push: surface=%s  dir=down (fallback)  distance=%.3fm%s",
+                surface_label, dist, "  (button)" if is_button else "",
+            )
+            result = self._cartesian_delta_motion_direct(
+                direction=np.array([0.0, 0.0, -1.0]),
+                distance=dist,
+                label=f"push fallback ({surface_label})",
+                execute=kwargs.get("execute", True),
+            )
+
+        if is_button and result.get("success") and kwargs.get("execute", True):
+            retract_dir = -normal_base if normal_base is not None else np.array([0.0, 0.0, 1.0])
+            self._cartesian_delta_motion_direct(
+                direction=retract_dir,
+                distance=0.03,
+                label=f"push button-release ({surface_label})",
+                execute=kwargs.get("execute", True),
+            )
+        return result
+
+    def pull(
+        self,
+        surface_label: str = "",
+        has_pivot: bool = False,
+        action_goal: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Move the gripper away from a surface along the positive surface normal.
+
+        When ``has_pivot`` is True, dispatches to ``pivot_pull`` using the
+        Molmo-grounded hinge point from ``metadata``. Otherwise moves along
+        +normal, falling back to pulling straight back (-X) if unavailable.
+        """
+        del action_goal
+        metadata = metadata or {}
+        normal_base = _normalise_vec(metadata.get("surface_normal_base"))
+        self._logger.info(
+            "pull: surface=%s  surface_normal_base=%s  confidence=%.2f  has_pivot=%s",
+            surface_label,
+            [f"{v:.3f}" for v in metadata["surface_normal_base"]] if metadata.get("surface_normal_base") is not None else None,
+            metadata.get("surface_normal_confidence", 0.0),
+            has_pivot,
+        )
 
         if has_pivot:
-            # Use Molmo-grounded hinge point when available.
             pivot_point_base = metadata.get("pivot_point_base")
-            pivot_radius_m = metadata.get("pivot_radius_m")
+
+            # Compute the arc angle needed to sweep the door fully open (90°).
+            # The gripper starts at the handle; we rotate until the lever arm is
+            # perpendicular to its starting direction, i.e. exactly 90°.
+            # If the pivot radius is known, we verify via arc length:
+            #   arc_length = radius * angle_rad  → angle_rad = arc_length / radius
+            # But since we always target 90° regardless of radius, and the pivot
+            # radius is already the correct lever arm, we use 90° directly.
+            # The sign (direction) is resolved inside pivot_pull from the surface normal.
+            arc_angle_deg = 90.0
+
             self._logger.info(
-                "push_pull: surface=%s  mode=pivot-pull  hinge=%s  radius=%s",
+                "pull: surface=%s  mode=pivot  hinge=%s  radius=%.3fm  arc=%.1f°",
                 surface_label,
                 (
                     f"[{pivot_point_base[0]:.3f},{pivot_point_base[1]:.3f},{pivot_point_base[2]:.3f}]"
                     if pivot_point_base is not None else "estimated"
                 ),
-                f"{pivot_radius_m:.3f}m" if pivot_radius_m is not None else "auto",
+                metadata.get("pivot_radius_m") or float("nan"),
+                arc_angle_deg,
             )
-            pivot_kwargs = dict(kwargs)
-            if pivot_point_base is not None:
-                pivot_kwargs["pivot_point"] = pivot_point_base
-            result = self.pivot_pull(**pivot_kwargs)
+            return self.pivot_pull(
+                pivot_point=pivot_point_base,
+                arc_angle_deg=arc_angle_deg,
+                metadata=metadata,
+                execute=kwargs.get("execute", True),
+                speed_mm_s=kwargs.get("speed_mm_s", 30.0),
+            )
 
-        elif normal_base is not None:
-            # Negate the surface normal to get the into-surface direction.
-            push_dir = -normal_base
-            dist = 0.05 if is_button else 0.08
+        if normal_base is not None:
+            move_dir = -normal_base  # -normal points away from the surface (camera faces outward)
             confidence = metadata.get("surface_normal_confidence", 0.0)
             self._logger.info(
-                "push_pull: surface=%s  mode=push  direction=surface_normal"
-                "  vec=[%.2f,%.2f,%.2f]  confidence=%.2f  distance=%.3fm%s",
-                surface_label,
-                push_dir[0], push_dir[1], push_dir[2],
-                confidence,
-                dist,
-                "  (button)" if is_button else "",
+                "pull: surface=%s  dir=-normal=[%.2f,%.2f,%.2f]  confidence=%.2f  distance=0.080m",
+                surface_label, move_dir[0], move_dir[1], move_dir[2], confidence,
             )
-            ignore_labels = self._displaceable_ignore_labels()
-            if ignore_labels:
-                self._logger.info(
-                    "push_pull surface_normal: ignoring displaceable meshes %s",
-                    sorted(ignore_labels),
-                )
-            result = self._cartesian_delta_motion(
-                direction=push_dir,
-                distance=dist,
-                label=f"push_pull surface_normal ({surface_label})",
-                speed_factor=kwargs.get("speed_factor", _DEFAULT_SAFE_SPEED_FACTOR),
+            return self._cartesian_delta_motion_direct(
+                direction=move_dir,
+                distance=0.08,
+                label=f"pull ({surface_label})",
                 execute=kwargs.get("execute", True),
-                ignore_labels=ignore_labels,
             )
 
-        elif force_direction == "perpendicular":
-            dist = 0.05 if is_button else 0.08
-            self._logger.info(
-                "push_pull: surface=%s  mode=push  direction=down  distance=%.3fm%s",
-                surface_label, dist, "  (button)" if is_button else "",
-            )
-            result = self.push(distance=dist, force_direction="down", **kwargs)
-
-        elif force_direction == "parallel":
-            # Compute push direction from object position relative to current TCP
-            # so the gripper slides toward (and past) the object rather than
-            # moving in a fixed base-frame axis.
-            push_vec = self._lateral_push_direction(surface_label)
-            if push_vec is not None:
-                vec_str = f"[{push_vec[0]:.2f}, {push_vec[1]:.2f}, {push_vec[2]:.2f}]"
-                self._logger.info(
-                    "push_pull: surface=%s  mode=push  direction=lateral%s  distance=0.080m",
-                    surface_label, f"({vec_str})",
-                )
-                ignore_labels = self._displaceable_ignore_labels()
-                if ignore_labels:
-                    self._logger.info(
-                        "push_pull lateral: ignoring displaceable meshes %s", sorted(ignore_labels)
-                    )
-                result = self._cartesian_delta_motion(
-                    direction=push_vec,
-                    distance=0.08,
-                    label=f"push_pull lateral ({surface_label})",
-                    speed_factor=kwargs.get("speed_factor", _DEFAULT_SAFE_SPEED_FACTOR),
-                    execute=kwargs.get("execute", True),
-                    ignore_labels=ignore_labels,
-                )
-            else:
-                # No registry position — fall back to +X push
-                self._logger.info(
-                    "push_pull: surface=%s  mode=push  direction=forward(fallback)  distance=0.080m",
-                    surface_label,
-                )
-                result = self.push(distance=0.08, force_direction="forward", **kwargs)
-
-        else:
-            self._logger.info(
-                "push_pull: surface=%s  mode=push  direction=%s  distance=0.080m",
-                surface_label, force_direction,
-            )
-            result = self.push(distance=0.08, force_direction=force_direction, **kwargs)
-
-        if is_button and result.get("success") and kwargs.get("execute", True):
-            # For button release: retract along the same direction that was pushed.
-            if normal_base is not None:
-                ignore_labels = self._displaceable_ignore_labels()
-                self._cartesian_delta_motion(
-                    direction=normal_base,  # opposite of push_dir
-                    distance=0.03,
-                    label=f"push_pull button-release ({surface_label})",
-                    speed_factor=kwargs.get("speed_factor", _DEFAULT_SAFE_SPEED_FACTOR),
-                    execute=kwargs.get("execute", True),
-                    ignore_labels=ignore_labels,
-                )
-            else:
-                self.pull(distance=0.03, force_direction="down", **kwargs)
-        return result
+        self._logger.info(
+            "pull: surface=%s  dir=-X (fallback)  distance=0.080m", surface_label,
+        )
+        return self._cartesian_delta_motion_direct(
+            direction=np.array([-1.0, 0.0, 0.0]),
+            distance=0.08,
+            label=f"pull fallback ({surface_label})",
+            execute=kwargs.get("execute", True),
+        )
 
     def _displaceable_ignore_labels(self) -> Optional[set]:
         """Return object IDs that are displaceable and can be ignored during push collision checks."""
@@ -792,6 +860,44 @@ class XArmPybulletPlannedPrimitives:
             execute=execute,
             ignore_labels=ignore_labels,
         )
+
+    def _cartesian_delta_motion_direct(
+        self,
+        direction: np.ndarray,
+        distance: float,
+        label: str,
+        speed_mm_s: float = 30.0,
+        execute: bool = True,
+    ) -> Dict[str, Any]:
+        """Send a Cartesian delta directly to the xArm — no PyBullet planning.
+
+        Used for push/pull where the gripper is already in contact with the
+        surface and a collision-free joint-space plan will always fail.
+        """
+        if not self._sync_planner_to_real_robot():
+            return {"success": False, "reason": "cannot read real robot joint state"}
+        tcp = self._planner.get_robot_tcp_pose()
+        if tcp is None:
+            return {"success": False, "reason": "cannot read tcp pose"}
+        pos, quat = tcp
+        unit = direction / max(float(np.linalg.norm(direction)), 1e-8)
+        target_pos = (pos + unit * float(distance)).tolist()
+
+        if not execute:
+            return {"success": True, "executed": False, "target_position": target_pos}
+
+        cartesian_move = getattr(self._robot, "cartesian_move", None)
+        if cartesian_move is None:
+            return {"success": False, "reason": "robot adapter does not support cartesian_move"}
+
+        ok = cartesian_move(
+            position=target_pos,
+            orientation_quat_xyzw=quat.tolist(),
+            speed=speed_mm_s,
+        )
+        if not ok:
+            return {"success": False, "reason": f"{label} cartesian move failed"}
+        return {"success": True, "executed": True, "target_position": target_pos}
 
     def _plan_and_execute_pose(
         self,

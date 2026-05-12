@@ -132,7 +132,7 @@ class IncrementalObjectTracker:
         )
 
         self.inference_state = self._make_inference_state()
-        self.inference_state["images"] = torch.empty((0, 3, 1024, 1024), device=device)
+        self.inference_state["images"] = torch.empty((0, 3, 1024, 1024), device="cpu")
         self.total_frames = 0
         self.objects_count = 0
         self.frame_cache_limit = detection_interval - 1
@@ -146,12 +146,12 @@ class IncrementalObjectTracker:
         state = {
             "images": None,
             "num_frames": 0,
-            "offload_video_to_cpu": False,
-            "offload_state_to_cpu": False,
+            "offload_video_to_cpu": True,
+            "offload_state_to_cpu": True,
             "video_height": None,
             "video_width": None,
             "device": compute_device,
-            "storage_device": compute_device,
+            "storage_device": torch.device("cpu"),
             "point_inputs_per_obj": {},
             "mask_inputs_per_obj": {},
             "cached_features": {},
@@ -180,7 +180,7 @@ class IncrementalObjectTracker:
         t = (t - img_mean) / img_std
 
         self.inference_state["images"] = torch.cat(
-            [self.inference_state["images"], t.unsqueeze(0).to(self.device)], dim=0
+            [self.inference_state["images"], t.unsqueeze(0)], dim=0
         )
         frame_idx = self.inference_state["num_frames"]
         self.inference_state["num_frames"] += 1
@@ -240,7 +240,7 @@ class IncrementalObjectTracker:
             if self.inference_state["images"].shape[0] > self.frame_cache_limit:
                 print(f"[Reset] Resetting inference state after {self.frame_cache_limit} frames.")
                 self.inference_state = self._make_inference_state()
-                self.inference_state["images"] = torch.empty((0, 3, 1024, 1024), device=self.device)
+                self.inference_state["images"] = torch.empty((0, 3, 1024, 1024), device="cpu")
                 self.inference_state["video_height"], self.inference_state["video_width"] = image_np.shape[:2]
 
             boxes, labels = self.grounding_predictor.predict(img_pil, self.prompt_text)
@@ -285,7 +285,7 @@ class IncrementalObjectTracker:
             mask_dict = MaskDictionaryModel(
                 promote_type="mask", mask_name=f"mask_{self.total_frames:05d}.npy"
             )
-            mask_list = torch.tensor(kept_masks).to(self.device)
+            mask_list = torch.tensor(kept_masks).cpu()
             mask_dict.add_new_frame_annotation(
                 mask_list=mask_list,
                 box_list=torch.tensor(kept_boxes) if not isinstance(kept_boxes, torch.Tensor) else kept_boxes,
@@ -358,7 +358,7 @@ class IncrementalObjectTracker:
         self.prompt_text = new_prompt
         self.total_frames = 0
         self.inference_state = self._make_inference_state()
-        self.inference_state["images"] = torch.empty((0, 3, 1024, 1024), device=self.device)
+        self.inference_state["images"] = torch.empty((0, 3, 1024, 1024), device="cpu")
         print(f"[Prompt Updated] '{new_prompt}'. Tracker state reset.")
 
     def save_current_state(self, output_dir, raw_image: np.ndarray = None):

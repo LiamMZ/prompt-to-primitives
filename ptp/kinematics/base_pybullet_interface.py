@@ -66,6 +66,7 @@ class BasePybulletInterface:
         n_arm_joints: int,
         static_camera_tf: Optional[Any] = None,
         use_gui: bool = False,
+        floor_z: float = 0.0,
     ) -> None:
         if not PYBULLET_AVAILABLE:
             raise ImportError(
@@ -88,6 +89,7 @@ class BasePybulletInterface:
         self._joint_name_to_index: Dict[str, int] = {}
         self._status_text_ids: List[int] = []
         self._use_gui = bool(use_gui)
+        self._floor_z = float(floor_z)
         # Optional depth-image collision checker; set via attach_collider().
         self._collider: Optional[Any] = None
         # First link index to include in floor-plane collision checks.
@@ -127,7 +129,11 @@ class BasePybulletInterface:
         connection_mode = p.GUI if self._use_gui else p.DIRECT
         self._physics_client = p.connect(connection_mode)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
-        self._floor_body_id = p.loadURDF("plane.urdf", physicsClientId=self._physics_client)
+        self._floor_body_id = p.loadURDF(
+            "plane.urdf",
+            basePosition=[0, 0, self._floor_z],
+            physicsClientId=self._physics_client,
+        )
         if self._use_gui:
             p.setGravity(0, 0, -9.81, physicsClientId=self._physics_client)
             p.configureDebugVisualizer(
@@ -491,11 +497,18 @@ class BasePybulletInterface:
 
         if best_joints is None and fallback_joints is not None:
             collision_detail = self._describe_collision(fallback_joints)
+            _tgt_pos_str = [f"{v:.4f}" for v in target_pos.tolist()]
+            _tgt_rpy_str = (
+                [f"{v:.1f}" for v in np.degrees(Rotation.from_quat(target_quat).as_euler("xyz")).tolist()]
+                if target_quat is not None else "None"
+            )
             logger.warning(
                 "IK: no collision-free solution found across %d seeds — "
-                "best solution (pos_err=%.4f) is in collision%s",
+                "best solution (pos_err=%.4f) is in collision%s  "
+                "target_pos=%s  target_rpy_deg=%s",
                 len(seeds), fallback_error,
                 f" [{collision_detail}]" if collision_detail else "",
+                _tgt_pos_str, _tgt_rpy_str,
             )
             best_joints = fallback_joints
 
@@ -828,7 +841,20 @@ class BasePybulletInterface:
             logger.warning("Start state is in collision — cannot plan")
             return None
         if not si.isValid(goal_state):
-            logger.warning("Goal state is in collision — cannot plan")
+            _tgt_pos_str = [f"{v:.4f}" for v in np.asarray(target_position).tolist()]
+            _tgt_rpy_str = (
+                [f"{v:.1f}" for v in np.degrees(
+                    Rotation.from_quat(np.asarray(target_orientation)).as_euler("xyz")
+                ).tolist()]
+                if target_orientation is not None else "None"
+            )
+            _goal_detail = self._describe_collision(goal_joints)
+            logger.warning(
+                "Goal state is in collision — cannot plan  "
+                "target_pos=%s  target_rpy_deg=%s%s",
+                _tgt_pos_str, _tgt_rpy_str,
+                f"  [{_goal_detail}]" if _goal_detail else "",
+            )
             return None
 
         pdef = ob.ProblemDefinition(si)

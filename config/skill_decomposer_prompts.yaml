@@ -8,6 +8,8 @@ template: |
 
   Action:
   - name: {action_name}
+  - high_level_action: {high_level_action}
+  - target_object_id: {target_object_id}
   - pddl_parameters: {action_parameters}
   - runtime_arguments: {parameters}
   - description: {action_description}
@@ -35,20 +37,34 @@ template: |
      "side" for handles, knobs, vertical faces, or overhead-obstructed items.
      Set `is_place: true` in parameters when placing.
 
-  3. push_pull — surface grounding (Molmo-driven):
-     `surface_label` is required (use the target object_id). The executor queries
-     Molmo to find the contact surface and computes the surface normal automatically —
-     do NOT specify target positions or normals.
-     Set `action_goal` to the high-level goal string when it improves prompt clarity
-     (e.g. "open", "close", "press", "slide") — this is passed to Molmo's pointing prompt.
-     Set `has_pivot: true` for revolute joints — Molmo locates the hinge automatically.
-     Set `is_button: true` for momentary press-and-retract.
+  3. push and pull — surface grounding (Molmo-driven):
+     `surface_label` is required for both (use the target object_id).
+     The executor queries Molmo to find the contact point and computes the surface
+     normal automatically — do NOT specify directions or normals yourself.
+     Set `action_goal` to clarify intent for Molmo (e.g. "press", "push", "open", "pull").
+
+     push: moves the gripper ALONG -normal (into the surface).
+       Use for: pressing buttons, pushing objects, closing drawers/doors.
+       Set `is_button: true` for momentary press-and-retract.
+
+     pull: moves the gripper ALONG +normal (away from the surface).
+       Use for: opening drawers, pulling handles, opening doors.
+       Set `has_pivot: true` for revolute joints (door/drawer hinges) —
+       Molmo locates the hinge automatically.
+       Set `hinge_axis: "vertical"` for side-hinged doors (hinge on left or right edge,
+       door swings left/right). Set `hinge_axis: "horizontal"` for top- or bottom-hinged
+       lids/flaps (hinge on top or bottom edge, door swings up/down). Null if unknown.
 
   4. move_gripper_to_pose ONLY moves the arm — it does NOT open or close the gripper.
      Always pair it with explicit open_gripper / close_gripper calls:
-       pick sequence:   open_gripper → move_gripper_to_pose (to object) → close_gripper → retract_gripper
-       place sequence:  move_gripper_to_pose (to target, is_place=true) → open_gripper → retract_gripper
+       pick sequence:         open_gripper → move_gripper_to_pose (to object) → close_gripper → retract_gripper
+       place sequence:        move_gripper_to_pose (to target, is_place=true) → open_gripper → retract_gripper
+       open door/drawer:      open_gripper → move_gripper_to_pose (to handle) → close_gripper → pull (has_pivot=true) → open_gripper → retract_gripper
+       push/press (no grasp): move_gripper_to_pose (to surface) → push
      Never rely on move_gripper_to_pose to actuate the gripper.
+     Any task that requires PULLING (opening a door, drawer, or handle) MUST include
+     close_gripper before pull so the robot is gripping the handle. Forgetting
+     close_gripper means the robot will swipe through the air and accomplish nothing.
 
   5. Gripper and motion primitives — pass `{}` for parameters unless overriding defaults:
      open_gripper, close_gripper, retract_gripper, twist.
@@ -60,8 +76,8 @@ template: |
   7. Parameter ownership — each parameter belongs to EXACTLY ONE primitive.
      NEVER cross-contaminate:
        move_gripper_to_pose  → point_label, is_place
-       push_pull             → surface_label, force_direction, is_button, has_pivot,
-                               action_goal
+       push                  → surface_label, is_button, action_goal
+       pull                  → surface_label, has_pivot, hinge_axis, action_goal
        open_gripper          → wait, timeout
        close_gripper         → wait, timeout, simple_close
        retract_gripper       → distance, speed_factor
@@ -72,7 +88,8 @@ template: |
 
 response_schema:
   type: object
-  required: ["primitives", "diagnostics"]
+  required: ["primitives", "assumptions", "diagnostics"]
+  additionalProperties: false
   properties:
     primitives:
       type: array
@@ -80,97 +97,118 @@ response_schema:
       items:
         type: object
         required: ["name", "parameters", "references", "metadata"]
+        additionalProperties: false
         properties:
           name:
             type: string
             enum:
               - move_gripper_to_pose
-              - push_pull
+              - push
+              - pull
               - open_gripper
               - close_gripper
               - retract_gripper
               - twist
           parameters:
             type: object
-            additionalProperties: true
+            additionalProperties: false
             properties:
               point_label:
-                type: string
+                type: ["string", "null"]
                 description: "move_gripper_to_pose only. Target object_id."
               is_place:
-                type: boolean
+                type: ["boolean", "null"]
                 description: "move_gripper_to_pose only. True when placing."
               surface_label:
-                type: string
-                description: "push_pull only (required). Object ID or surface label."
-              force_direction:
-                type: string
-                enum: ["perpendicular", "parallel"]
-                description: "push_pull only."
+                type: ["string", "null"]
+                description: "push / pull only (required). Object ID or surface label."
               is_button:
-                type: boolean
-                description: "push_pull only. Momentary press then retract."
+                type: ["boolean", "null"]
+                description: "push only. Momentary press then retract."
               has_pivot:
-                type: boolean
-                description: "push_pull only. Revolute articulation (door/drawer)."
+                type: ["boolean", "null"]
+                description: "pull only. Revolute articulation (door/drawer) — Molmo locates the hinge."
+              hinge_axis:
+                type: ["string", "null"]
+                enum: ["vertical", "horizontal", null]
+                description: "pull only (with has_pivot). 'vertical' = side hinge (door swings left/right). 'horizontal' = top/bottom hinge (lid swings up/down). Null if unknown."
               action_goal:
-                type: string
-                description: "push_pull only. High-level goal (e.g. 'open', 'close', 'press')."
+                type: ["string", "null"]
+                description: "push / pull only. High-level goal passed to Molmo (e.g. 'press', 'open', 'pull')."
               wait:
-                type: boolean
+                type: ["boolean", "null"]
                 description: "open_gripper / close_gripper only."
               timeout:
-                type: number
+                type: ["number", "null"]
                 description: "open_gripper / close_gripper only."
               simple_close:
-                type: boolean
+                type: ["boolean", "null"]
                 description: "close_gripper only."
               distance:
-                type: number
+                type: ["number", "null"]
                 description: "retract_gripper only."
               speed_factor:
-                type: number
+                type: ["number", "null"]
                 description: "retract_gripper / twist only."
               direction:
-                type: string
-                enum: ["clockwise", "counterclockwise"]
+                type: ["string", "null"]
+                enum: ["clockwise", "counterclockwise", null]
                 description: "twist only."
               turn_amount:
-                type: string
-                enum: ["quarter_turn", "half_turn", "three_quarter_turn", "full_turn"]
+                type: ["string", "null"]
+                enum: ["quarter_turn", "half_turn", "three_quarter_turn", "full_turn", null]
                 description: "twist only. quarter_turn=90°, half_turn=180°, three_quarter_turn=270°, full_turn=360°."
+            required:
+              - point_label
+              - is_place
+              - surface_label
+              - is_button
+              - has_pivot
+              - hinge_axis
+              - action_goal
+              - wait
+              - timeout
+              - simple_close
+              - distance
+              - speed_factor
+              - direction
+              - turn_amount
           references:
             type: object
             additionalProperties: false
+            required: ["object_id"]
             properties:
               object_id:
-                type: string
-                description: Target object ID for this step.
+                type: ["string", "null"]
+                description: Target object ID for this step. Null for primitives with no specific target.
           metadata:
             type: object
-            additionalProperties: true
+            additionalProperties: false
+            required: ["pointing_guidance", "approach_direction"]
             properties:
               pointing_guidance:
-                type: string
+                type: ["string", "null"]
                 description: >
                   A "Point to …" instruction sent verbatim to Molmo2 for move_gripper_to_pose.
                   Must begin with "Point to" and describe contact geometry in detail —
                   not the action intent (e.g. "Point to the cylindrical body just below
                   the rim of the red cup", not "pick up the cup").
+                  Null for primitives other than move_gripper_to_pose.
               approach_direction:
-                type: string
-                enum: ["top_down", "side"]
+                type: ["string", "null"]
+                enum: ["top_down", "side", null]
                 description: >
                   Preferred gripper approach direction for move_gripper_to_pose.
                   Executor validates against clearance corridors and falls back
-                  if the preferred direction is blocked.
+                  if the preferred direction is blocked. Null for other primitives.
     assumptions:
       type: array
       items:
         type: string
     diagnostics:
       type: object
-      required: ["rationale"]
+      required: ["rationale", "freshness_notes", "warnings"]
+      additionalProperties: false
       properties:
         rationale:
           type: string

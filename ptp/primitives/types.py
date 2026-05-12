@@ -111,7 +111,7 @@ class PrimitiveCall:
             "frame": self.frame,
             "parameters": self.parameters,
             "references": self.references,
-            "metadata": self.metadata,
+            "metadata": {k: v for k, v in self.metadata.items() if not isinstance(v, (bytes, bytearray))},
         }
 
     @classmethod
@@ -181,10 +181,14 @@ class SkillPlan:
     registry_hash: Optional[str] = None
     source_snapshot_id: Optional[str] = None
     raw_llm_response: Optional[str] = None
+    high_level_action: str = ""          # e.g. "open", "switch_on" from TaskParser
+    target_object_id: Optional[str] = None  # resolved object_id from TaskParser
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "action_name": self.action_name,
+            "high_level_action": self.high_level_action,
+            "target_object_id": self.target_object_id,
             "primitives": [p.to_dict() for p in self.primitives],
             "diagnostics": self.diagnostics.to_dict(),
             "registry_hash": self.registry_hash,
@@ -196,6 +200,8 @@ class SkillPlan:
     def from_dict(cls, data: Dict[str, Any]) -> "SkillPlan":
         return cls(
             action_name=data.get("action_name", ""),
+            high_level_action=data.get("high_level_action", ""),
+            target_object_id=data.get("target_object_id"),
             primitives=[PrimitiveCall.from_dict(p) for p in data.get("primitives", [])],
             diagnostics=SkillPlanDiagnostics.from_dict(data.get("diagnostics") or {}),
             registry_hash=data.get("registry_hash"),

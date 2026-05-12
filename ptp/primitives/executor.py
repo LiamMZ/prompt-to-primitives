@@ -142,6 +142,12 @@ class PrimitiveExecutor:
             try:
                 with timer.measure(f"execute.{primitive.name}[{idx}]"):
                     raw_result = method(**call_params)
+                if isinstance(raw_result, dict) and raw_result.get("success") is False:
+                    success = False
+                    self.logger.error(
+                        "Primitive '%s' returned failure: %s",
+                        primitive.name, raw_result.get("reason", raw_result),
+                    )
             except Exception as exc:
                 success = False
                 raw_result = str(exc)
@@ -219,23 +225,33 @@ class PrimitiveExecutor:
         else:
             self.logger.info("[prepare_plan] No primitives interface; skipping base-frame transform")
 
+        # Seed preset_orientation from the LLM's approach_direction on every
+        # move_gripper_to_pose before any grounding pass runs.  This ensures the
+        # grasp planner always has the right seed even when pointing_guidance
+        # grounding fails or no point cloud is available for antipodal sampling.
+        for primitive in plan.primitives:
+            if primitive.name == "move_gripper_to_pose":
+                approach_dir = primitive.metadata.get("approach_direction", "top_down")
+                preset = "side" if approach_dir == "side" else "top_down"
+                primitive.parameters.setdefault("preset_orientation", preset)
+
         # Ground any deferred pointing_guidance via Molmo before coordinate translation.
         _grounding_timings: Dict[str, float] = {}
         for idx, primitive in enumerate(plan.primitives):
             if primitive.name == "move_gripper_to_pose" and primitive.metadata.get("pointing_guidance"):
                 _t0 = time.perf_counter()
-                self._resolve_pointing_guidance(primitive, artifacts, plan, idx)
+                self._resolve_pointing_guidance(primitive, artifacts, plan, idx, world_state)
                 _grounding_timings[f"molmo_grounding.move_gripper_to_pose[{idx}]"] = round(
                     time.perf_counter() - _t0, 4
                 )
 
-        # For push_pull: run Molmo on the surface_label to get an interaction
+        # For push/pull: run Molmo on the surface_label to get an interaction
         # point, then compute the surface normal at that point from depth.
         for idx, primitive in enumerate(plan.primitives):
-            if primitive.name == "push_pull":
+            if primitive.name in ("push", "pull"):
                 _t0 = time.perf_counter()
-                self._resolve_push_pull_surface(primitive, artifacts, cam_pose, plan, idx)
-                _grounding_timings[f"molmo_grounding.push_pull[{idx}]"] = round(
+                self._resolve_push_pull_surface(primitive, artifacts, cam_pose, plan, idx, world_state)
+                _grounding_timings[f"molmo_grounding.{primitive.name}[{idx}]"] = round(
                     time.perf_counter() - _t0, 4
                 )
 
@@ -346,6 +362,14 @@ class PrimitiveExecutor:
                     "[prepare_plan] [%d] antipodal grasp skipped — no point cloud for %r (%s pts)",
                     idx, ref_id, len(obj_pts) if obj_pts is not None else 0,
                 )
+
+        # Strip null-valued parameters and metadata fields (strict-schema output uses null
+        # as a placeholder for unused optional fields).
+        for primitive in plan.primitives:
+            for k in [k for k, v in list(primitive.parameters.items()) if v is None]:
+                primitive.parameters.pop(k)
+            for k in [k for k, v in list(primitive.metadata.items()) if v is None]:
+                primitive.metadata.pop(k)
 
         # Strip unknown parameters (LLM cross-contamination fallback).
         for idx, primitive in enumerate(plan.primitives):
@@ -459,6 +483,7 @@ class PrimitiveExecutor:
         cam_pose: Optional[Any],
         plan: Any,
         step_idx: int,
+        world_state: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Ground push_pull surface_label via Molmo, then compute the surface normal.
 
@@ -510,36 +535,43 @@ class PrimitiveExecutor:
 
             # ---- 2a. Molmo: point at the push/pull surface contact point ----
             surface_prompt = build_prompt("push_pull", surface_label, action_goal=action_goal)
-            actions = {"_surface"}
-            custom_prompts = {"_surface": surface_prompt}
-
-            # ---- 2b. Molmo: point at the hinge location (pivot only) ----
-            if has_pivot:
-                hinge_prompt = build_hinge_prompt(
-                    surface_label,
-                    action_goal=action_goal,
-                )
-                actions.add("_hinge")
-                custom_prompts["_hinge"] = hinge_prompt
+            primitive.metadata["surface_prompt"] = surface_prompt
 
             object_mask = self._masks.get(ref_id) if ref_id else None
 
-            results = detector.get_interaction_points(
+            # Look up the target object's bounding box from detections so Molmo
+            # receives a crop centred on the object, preventing it from pointing
+            # at the wrong hinged object in a scene with multiple articulated items.
+            bbox_2d = None
+            if ref_id and world_state:
+                det_map = {
+                    d.get("object_id"): d
+                    for d in (world_state.get("latest_detections") or [])
+                }
+                det = det_map.get(ref_id)
+                if det:
+                    bbox_2d = det.get("bounding_box_2d")
+
+            surface_results = detector.get_interaction_points(
                 rgb_image=rgb,
                 depth_frame=depth,
                 camera_intrinsics=intr,
                 object_id=ref_id,
                 object_type=surface_label,
-                bounding_box_2d=None,
-                actions=actions,
+                bounding_box_2d=bbox_2d,
+                actions={"_surface"},
                 robot_state=artifacts.robot_state,
-                custom_prompts=custom_prompts,
+                custom_prompts={"_surface": surface_prompt},
                 object_mask=object_mask,
+                all_masks=self._masks,
             )
 
-            ip_surface = results.get("_surface")
+            ip_surface = surface_results.get("_surface")
             if ip_surface is None:
                 raise ValueError("Molmo returned no surface point")
+
+            if ip_surface.input_image_bytes is not None:
+                primitive.metadata["molmo_input_image_bytes"] = ip_surface.input_image_bytes
 
             # ip.position_2d is normalised [y, x] in 0-1000; convert to pixels.
             pos2d = ip_surface.position_2d  # [norm_y, norm_x]
@@ -595,12 +627,51 @@ class PrimitiveExecutor:
             primitive.metadata["surface_normal_base"] = normal_base.tolist()
             primitive.metadata["surface_normal_confidence"] = float(confidence)
             primitive.metadata["surface_pixel_yx"] = [px_row, px_col]
-            # Normalised position_2d for run output annotation (same key as move_gripper_to_pose)
-            primitive.metadata["position_2d"] = list(ip_surface.position_2d)
+            primitive.metadata["surface_point_2d"] = list(ip_surface.position_2d)
 
             # ---- 6. Hinge grounding (pivot_pull only) ----
+            # The hinge prompt is built *after* the surface contact pixel is
+            # known so Molmo gets explicit gripper-position context: "the gripper
+            # will grip here — where is the hinge relative to that?"
             if has_pivot:
-                ip_hinge = results.get("_hinge")
+                hinge_axis: Optional[str] = primitive.parameters.get("hinge_axis") or None
+                # Find the grip pixel: use the most recent move_gripper_to_pose before
+                # this step that has a grounded position_2d (the handle grasp point).
+                # Fall back to the surface contact pixel if none is found.
+                grip_pixel_yx: Tuple[float, float] = (px_row, px_col)
+                for prev in reversed(plan.primitives[:step_idx]):
+                    if prev.name == "move_gripper_to_pose":
+                        prev_pos2d = prev.metadata.get("position_2d")
+                        if prev_pos2d and len(prev_pos2d) >= 2:
+                            grip_pixel_yx = (
+                                float(prev_pos2d[0]) / 1000.0 * h,
+                                float(prev_pos2d[1]) / 1000.0 * w,
+                            )
+                        break
+
+                hinge_prompt = build_hinge_prompt(
+                    surface_label,
+                    action_goal=action_goal,
+                    gripper_pixel_yx=grip_pixel_yx,
+                )
+                primitive.metadata["hinge_prompt"] = hinge_prompt
+                hinge_results = detector.get_interaction_points(
+                    rgb_image=rgb,
+                    depth_frame=depth,
+                    camera_intrinsics=intr,
+                    object_id=ref_id,
+                    object_type=surface_label,
+                    bounding_box_2d=bbox_2d,
+                    actions={"_hinge"},
+                    robot_state=artifacts.robot_state,
+                    custom_prompts={"_hinge": hinge_prompt},
+                    object_mask=object_mask,
+                    all_masks=self._masks,
+                    mark_pixel_yx=grip_pixel_yx,
+                )
+                ip_hinge = hinge_results.get("_hinge")
+                if ip_hinge is not None and ip_hinge.input_image_bytes is not None:
+                    primitive.metadata["molmo_hinge_input_image_bytes"] = ip_hinge.input_image_bytes
                 if ip_hinge is None:
                     self.logger.warning(
                         "[prepare_plan] [%d] push_pull pivot: Molmo returned no hinge point — "
@@ -608,7 +679,33 @@ class PrimitiveExecutor:
                         step_idx,
                     )
                 else:
-                    hinge_pos2d = ip_hinge.position_2d  # [norm_y, norm_x]
+                    hinge_pos2d = list(ip_hinge.position_2d)  # [norm_y, norm_x] in 0-1000
+
+                    # Snap the hinge pixel to align with the grip pixel based on
+                    # hinge_axis from the LLM plan:
+                    #   vertical   → side hinge, rotates around vertical axis →
+                    #                hinge is left/right of grip, same height →
+                    #                snap hinge row to grip row
+                    #   horizontal → top/bottom hinge, rotates around horizontal axis →
+                    #                hinge is above/below grip, same column →
+                    #                snap hinge col to grip col
+                    grip_norm_y = grip_pixel_yx[0] / h * 1000.0
+                    grip_norm_x = grip_pixel_yx[1] / w * 1000.0
+                    if hinge_axis == "vertical":
+                        hinge_pos2d[0] = grip_norm_y
+                        self.logger.info(
+                            "[prepare_plan] [%d] push_pull pivot: snapped hinge row to grip row "
+                            "(vertical hinge axis)",
+                            step_idx,
+                        )
+                    elif hinge_axis == "horizontal":
+                        hinge_pos2d[1] = grip_norm_x
+                        self.logger.info(
+                            "[prepare_plan] [%d] push_pull pivot: snapped hinge col to grip col "
+                            "(horizontal hinge axis)",
+                            step_idx,
+                        )
+
                     hinge_row = float(hinge_pos2d[0]) / 1000.0 * h
                     hinge_col = float(hinge_pos2d[1]) / 1000.0 * w
 
@@ -619,8 +716,9 @@ class PrimitiveExecutor:
                     )
 
                     # Back-project hinge pixel to camera-frame 3D.
+                    # compute_3d_position expects 0-1000 normalised coords, not pixels.
                     hinge_3d = compute_3d_position(
-                        [hinge_row, hinge_col], depth, intr
+                        list(hinge_pos2d), depth, intr
                     )
                     if hinge_3d is None:
                         self.logger.warning(
@@ -643,14 +741,10 @@ class PrimitiveExecutor:
 
                         # Compute pivot radius: XY-plane distance from hinge to surface contact.
                         # This is the lever arm the pivot_pull arc is computed from.
+                        # ip_surface.position_3d is already in base frame (transformed by
+                        # molmo_point_detector._build_interaction_point via robot_state["camera"]).
                         surface_3d = ip_surface.position_3d
-                        if surface_3d is not None and cam_pose is not None:
-                            surface_cam = np.asarray(surface_3d, dtype=float)
-                            surface_base = cam_pose.rotation.apply(surface_cam) + cam_pose.position
-                        elif surface_3d is not None:
-                            surface_base = np.asarray(surface_3d, dtype=float)
-                        else:
-                            surface_base = None
+                        surface_base = np.asarray(surface_3d, dtype=float) if surface_3d is not None else None
 
                         pivot_radius_m: Optional[float] = None
                         if surface_base is not None:
@@ -665,6 +759,7 @@ class PrimitiveExecutor:
                         )
 
                         primitive.metadata["pivot_point_base"] = hinge_base.tolist()
+                        primitive.metadata["hinge_position_2d"] = list(hinge_pos2d)
                         if pivot_radius_m is not None:
                             primitive.metadata["pivot_radius_m"] = pivot_radius_m
 
@@ -725,6 +820,7 @@ class PrimitiveExecutor:
         artifacts: Any,
         plan: Any,
         step_idx: int,
+        world_state: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Ground a move_gripper_to_pose primitive using pointing_guidance from metadata.
 
@@ -784,6 +880,17 @@ class PrimitiveExecutor:
                         obj_type = getattr(live_obj, "object_type", "object") or "object"
                         clearance_profile = getattr(live_obj, "clearance_profile", None)
 
+            if bbox is None and ref_id and world_state:
+                det_map = {
+                    d.get("object_id"): d
+                    for d in (world_state.get("latest_detections") or [])
+                }
+                det = det_map.get(ref_id)
+                if det:
+                    bbox = det.get("bounding_box_2d")
+                    if obj_type == "object":
+                        obj_type = det.get("object_type") or "object"
+
             object_mask = self._masks.get(ref_id) if ref_id else None
 
             self.logger.info(
@@ -803,11 +910,18 @@ class PrimitiveExecutor:
                 custom_prompts={"_guided": guidance},
                 clearance_profile=clearance_profile,
                 object_mask=object_mask,
+                all_masks=self._masks,
             )
 
             ip = results.get("_guided")
             if ip is None:
                 raise ValueError("Molmo returned no point for guidance prompt")
+
+            if ip.position_3d is None:
+                raise ValueError(
+                    "Molmo returned a 2D point but position_3d is None "
+                    "(depth back-projection failed or robot_state missing camera key)"
+                )
 
             if ip.position_3d is not None:
                 pos_3d = np.asarray(ip.position_3d, dtype=float)
@@ -882,7 +996,7 @@ class PrimitiveExecutor:
             primitive.metadata["molmo_position_3d"] = (
                 np.asarray(ip.position_3d).tolist() if ip.position_3d is not None else None
             )
-            # Store 2D pixel location for run output annotation
+            # Store 2D pixel location for run output annotation — always, even if 3D failed
             if ip.position_2d is not None:
                 primitive.metadata["position_2d"] = list(ip.position_2d)
             self.logger.info(

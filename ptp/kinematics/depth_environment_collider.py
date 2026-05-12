@@ -59,6 +59,8 @@ _MIN_COMPONENT_TRIS = 20       # connected components smaller than this are nois
 _OUTLIER_NB_POINTS = 16        # statistical outlier removal neighbour count
 _OUTLIER_STD_RATIO = 1.5       # points beyond mean + ratio×std are removed
 _COLLISION_MARGIN_M = 0.005
+_WORLD_Z_MIN_M = -0.10          # discard points below this (noise/mis-projection below table)
+_WORLD_Z_MAX_M = 1.0            # discard points above the workspace ceiling
 # Pixels within this many pixels of any object mask edge are excluded from the
 # background mesh.  Depth sensors bleed values behind objects at silhouette
 # edges; eroding the exclusion zone removes those leaked pixels before BPA.
@@ -147,6 +149,7 @@ class DepthEnvironmentCollider:
         depth_m: np.ndarray,
         intrinsics: CameraIntrinsics,
         masks: Dict[str, np.ndarray],
+        debug_dir: Optional[str] = None,
     ) -> Dict[str, bool]:
         """Rebuild from an already-captured depth array.
 
@@ -154,6 +157,7 @@ class DepthEnvironmentCollider:
             depth_m: (H, W) float32 depth image in metres.
             intrinsics: Camera intrinsic parameters.
             masks: {object_id: bool H×W mask}.
+            debug_dir: If given, write ``depth_debug.png`` into this directory.
 
         Returns:
             Dict mapping each label to True if its mesh was built successfully.
@@ -162,7 +166,7 @@ class DepthEnvironmentCollider:
         if T_base_cam is None:
             logger.warning("DepthEnvironmentCollider: cannot read camera extrinsic")
             return {}
-        return self._rebuild(depth_m, intrinsics, T_base_cam, masks)
+        return self._rebuild(depth_m, intrinsics, T_base_cam, masks, debug_dir=debug_dir)
 
     def check_trajectory(
         self,
@@ -318,8 +322,8 @@ class DepthEnvironmentCollider:
         for obj_id, mask in masks.items():
             if mask.shape != (h, w):
                 continue
-            pts = self._depth_to_world_points(depth_m, intrinsics, T_base_cam,
-                                               pixel_mask=mask.astype(bool))
+            pts, _, _ = self._depth_to_world_points(depth_m, intrinsics, T_base_cam,
+                                                     pixel_mask=mask.astype(bool))
             if pts is not None and len(pts) > 0:
                 if obj_id not in self._accumulated:
                     self._accumulated[obj_id] = []
@@ -342,8 +346,8 @@ class DepthEnvironmentCollider:
         except ImportError:
             background_mask = ~union_mask
 
-        pts_bg = self._depth_to_world_points(depth_m, intrinsics, T_base_cam,
-                                              pixel_mask=background_mask)
+        pts_bg, _, _ = self._depth_to_world_points(depth_m, intrinsics, T_base_cam,
+                                                    pixel_mask=background_mask)
         if pts_bg is not None and len(pts_bg) > 0:
             if BACKGROUND_ID not in self._accumulated:
                 self._accumulated[BACKGROUND_ID] = []
@@ -409,6 +413,7 @@ class DepthEnvironmentCollider:
         intrinsics: CameraIntrinsics,
         T_base_cam: np.ndarray,
         masks: Dict[str, np.ndarray],
+        debug_dir: Optional[str] = None,
     ) -> Dict[str, bool]:
         self.remove()
         self._cam_pos_world = T_base_cam[:3, 3].copy()
@@ -429,8 +434,8 @@ class DepthEnvironmentCollider:
                 logger.warning("DepthEnvironmentCollider: mask shape mismatch for %s", obj_id)
                 results[obj_id] = False
                 continue
-            pts = self._depth_to_world_points(depth_m, intrinsics, T_base_cam,
-                                               pixel_mask=mask.astype(bool))
+            pts, _, _ = self._depth_to_world_points(depth_m, intrinsics, T_base_cam,
+                                                     pixel_mask=mask.astype(bool))
             results[obj_id] = self._build_body(pts, obj_id)
 
         # Build background body with two levels of occlusion filtering so the
@@ -478,8 +483,8 @@ class DepthEnvironmentCollider:
             )
             background_mask = ~union_mask
 
-        pts_bg = self._depth_to_world_points(depth_m, intrinsics, T_base_cam,
-                                              pixel_mask=background_mask)
+        pts_bg, _, _ = self._depth_to_world_points(depth_m, intrinsics, T_base_cam,
+                                                    pixel_mask=background_mask)
         results[BACKGROUND_ID] = self._build_body(pts_bg, BACKGROUND_ID)
 
         built = [lbl for lbl, ok in results.items() if ok]
@@ -487,7 +492,87 @@ class DepthEnvironmentCollider:
             "DepthEnvironmentCollider: built %d bodies (%s)",
             len(built), ", ".join(built),
         )
+        if debug_dir is not None:
+            import os
+            out_path = os.path.join(debug_dir, "depth_debug.png")
+            self._save_depth_debug(depth_m, masks, out_path=out_path)
         return results
+
+    def _save_depth_debug(
+        self,
+        depth_m: np.ndarray,
+        masks: Optional[Dict[str, np.ndarray]] = None,
+        out_path: str = "/tmp/collider_depth_debug.png",
+    ) -> None:
+        """Save depth debug images: plain colourmap and one with mask overlays.
+
+        Writes two files:
+          - ``out_path``              — raw depth colourmap (no masks)
+          - ``<stem>_masks.<ext>``    — same colourmap with per-object mask tints
+        """
+        try:
+            import cv2
+        except ImportError:
+            logger.debug("cv2 not available — skipping depth debug image")
+            return
+
+        # Auto-scale depth to the p2/p98 range of valid pixels so scene
+        # contrast is maximised regardless of the fixed _DEPTH_MIN/MAX constants.
+        valid = depth_m[(depth_m > _DEPTH_MIN_M) & (depth_m < _DEPTH_MAX_M)]
+        if len(valid) > 0:
+            d_lo = float(np.percentile(valid, 2))
+            d_hi = float(np.percentile(valid, 98))
+            if d_hi <= d_lo:
+                d_lo, d_hi = _DEPTH_MIN_M, _DEPTH_MAX_M
+        else:
+            d_lo, d_hi = _DEPTH_MIN_M, _DEPTH_MAX_M
+        d_clipped = np.clip(depth_m, d_lo, d_hi)
+        d_scaled = ((d_clipped - d_lo) / (d_hi - d_lo) * 255).astype(np.uint8)
+        vis = cv2.applyColorMap(d_scaled, cv2.COLORMAP_MAGMA)
+
+        cv2.imwrite(out_path, vis)
+        logger.info("DepthEnvironmentCollider: depth debug saved → %s", out_path)
+
+        if not masks:
+            return
+
+        import os
+        stem, ext = os.path.splitext(out_path)
+        masks_path = f"{stem}_masks{ext}"
+
+        # Distinct BGR tint colours for each mask.
+        _TINT_COLOURS = [
+            (80,  200,  80),
+            (80,   80, 220),
+            (220, 160,  40),
+            (40,  220, 220),
+            (200,  80, 200),
+            (80,  200, 200),
+        ]
+        overlay = vis.copy()
+        h, w = depth_m.shape
+        for idx, (obj_id, mask) in enumerate(masks.items()):
+            if mask.shape != (h, w):
+                continue
+            colour = _TINT_COLOURS[idx % len(_TINT_COLOURS)]
+            tint = np.zeros_like(overlay)
+            tint[mask.astype(bool)] = colour
+            overlay = cv2.addWeighted(overlay, 1.0, tint, 0.45, 0)
+            # Draw contour so mask edges are visible even at low opacity.
+            contours, _ = cv2.findContours(
+                mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            cv2.drawContours(overlay, contours, -1, colour, 2)
+            # Label in the centroid of the mask.
+            ys, xs = np.where(mask.astype(bool))
+            if len(xs):
+                cx_m, cy_m = int(xs.mean()), int(ys.mean())
+                cv2.putText(overlay, str(obj_id), (cx_m, cy_m),
+                            cv2.FONT_HERSHEY_SIMPLEX, max(0.4, w / 1200),
+                            (255, 255, 255), 1, cv2.LINE_AA)
+
+        cv2.imwrite(masks_path, overlay)
+        logger.info("DepthEnvironmentCollider: depth debug (masks) saved → %s", masks_path)
 
     def _depth_to_world_points(
         self,
@@ -495,8 +580,14 @@ class DepthEnvironmentCollider:
         intrinsics: CameraIntrinsics,
         T_base_cam: np.ndarray,
         pixel_mask: np.ndarray,
-    ) -> Optional[np.ndarray]:
-        """Backproject masked depth pixels to world-frame 3-D points."""
+    ):
+        """Backproject masked depth pixels to world-frame 3-D points.
+
+        Returns:
+            (pts_world, rows_kept, cols_kept) where rows/cols are the pixel
+            coordinates of the surviving points (after Z clamping), or
+            (None, None, None) if no valid points remain.
+        """
         h, w = depth_m.shape
         fx, fy = intrinsics.fx, intrinsics.fy
         cx, cy = intrinsics.cx, intrinsics.cy
@@ -511,17 +602,28 @@ class DepthEnvironmentCollider:
 
         valid = sampled_mask & (d > _DEPTH_MIN_M) & (d < _DEPTH_MAX_M)
         if not np.any(valid):
-            return None
+            return None, None, None
 
+        rows_v = rr[valid]
+        cols_v = cc[valid]
         d_v = d[valid].astype(float)
-        x = (cc[valid].astype(float) - cx) * d_v / fx
-        y = (rr[valid].astype(float) - cy) * d_v / fy
-        z = d_v
-        pts_cam = np.stack([x, y, z], axis=1)
+        x = (cols_v.astype(float) - cx) * d_v / fx
+        y = (rows_v.astype(float) - cy) * d_v / fy
+        pts_cam = np.stack([x, y, d_v], axis=1)
 
         R = T_base_cam[:3, :3]
         t = T_base_cam[:3, 3]
-        return ((R @ pts_cam.T).T + t).astype(np.float32)
+        pts_world = ((R @ pts_cam.T).T + t).astype(np.float32)
+
+        # Discard points outside the valid workspace Z range — these are
+        # depth noise or mis-projected background points below the floor.
+        z_valid = (pts_world[:, 2] >= _WORLD_Z_MIN_M) & (pts_world[:, 2] <= _WORLD_Z_MAX_M)
+        pts_world = pts_world[z_valid]
+        rows_v    = rows_v[z_valid]
+        cols_v    = cols_v[z_valid]
+        if len(pts_world) == 0:
+            return None, None, None
+        return pts_world, rows_v, cols_v
 
     def _build_body(self, pts: Optional[np.ndarray], label: str) -> bool:
         """Reconstruct mesh from points and add it to PyBullet. Returns success."""

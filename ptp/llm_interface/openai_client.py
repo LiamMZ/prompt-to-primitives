@@ -213,7 +213,7 @@ class OpenAIClient(LLMClient):
                 "json_schema": {
                     "name": "response",
                     "schema": config.response_json_schema,
-                    "strict": False,
+                    "strict": True,
                 },
             }
         elif config.response_mime_type == "application/json":

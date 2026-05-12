@@ -163,7 +163,7 @@ class MolmoPointDetector:
         load_kwargs: Dict[str, Any] = dict(
             trust_remote_code=True,
             device_map="auto",
-            max_memory={0: "6GiB", "cpu": "48GiB"},
+            max_memory={0: "4GiB", "cpu": "48GiB"},
         )
         if quant_cfg is not None:
             load_kwargs["quantization_config"] = quant_cfg
@@ -217,6 +217,9 @@ class MolmoPointDetector:
         custom_prompts: Optional[Dict[str, str]] = None,
         clearance_profile: Optional[Any] = None,
         object_mask: Optional[np.ndarray] = None,
+        all_masks: Optional[Dict[str, np.ndarray]] = None,
+        crop_pad_frac: float = 0.10,
+        mark_pixel_yx: Optional[Tuple[float, float]] = None,
     ) -> Dict[str, InteractionPoint]:
         """
         Return a Dict[action → InteractionPoint] for a single detected object.
@@ -239,6 +242,15 @@ class MolmoPointDetector:
             object_mask: Boolean HxW mask for the target object from GSAM2.  When
                 provided, pixels outside the mask are darkened to black before the
                 image is sent to Molmo, removing distracting context.
+            all_masks: Full mask dict (object_id → HxW bool array) for the scene.
+                Sub-component objects whose mask centroid falls inside the crop region
+                are OR-ed into the visibility mask so Molmo can see them.
+            crop_pad_frac: Fractional padding added around the bbox crop on each side
+                (default 0.10 = 10% of the object's height/width).
+            mark_pixel_yx: Optional (row, col) pixel in full-frame coordinates to draw
+                a visible crosshair marker on the image before sending to Molmo.
+                Used to show Molmo where the gripper contact point is so it can
+                reason about relative positions (e.g. hinge location).
 
         Returns:
             Dict mapping each queried action to its InteractionPoint, or an
@@ -250,43 +262,96 @@ class MolmoPointDetector:
         custom_prompts = custom_prompts or {}
         h, w = rgb_image.shape[:2]
 
-        # Apply object mask: darken everything outside the target object so
-        # Molmo focuses only on the relevant region.
-        if object_mask is not None:
-            mask = object_mask
-            if mask.shape != (h, w):
-                from PIL import Image as _PILr
-                mask = np.array(
-                    _PILr.fromarray(mask.astype(np.uint8) * 255).resize(
-                        (w, h), _PILr.NEAREST
-                    )
-                ).astype(bool)
-            masked_rgb = rgb_image.copy()
-            masked_rgb[~mask] = 0
-            rgb_image = masked_rgb
-            if depth_frame is not None:
-                masked_depth = depth_frame.copy()
-                masked_depth[~mask] = 0.0
-                depth_frame = masked_depth
-
-        # Determine crop region. bounding_box_2d is [y1, x1, y2, x2] in 0-1000
-        # normalized scale (same as position_2d); convert to pixels before slicing.
+        # Compute padded crop bounds from bbox (or full frame).
         if bounding_box_2d is not None and len(bounding_box_2d) == 4:
             ny1, nx1, ny2, nx2 = bounding_box_2d
-            y1 = max(0, int(ny1 * h / 1000.0))
-            x1 = max(0, int(nx1 * w / 1000.0))
-            y2 = min(h, int(ny2 * h / 1000.0))
-            x2 = min(w, int(nx2 * w / 1000.0))
-            crop_rgb = rgb_image[y1:y2, x1:x2]
-            crop_depth = depth_frame[y1:y2, x1:x2] if depth_frame is not None else None
-            crop_offset = (y1, x1)
+            raw_y1 = int(ny1 * h / 1000.0)
+            raw_x1 = int(nx1 * w / 1000.0)
+            raw_y2 = int(ny2 * h / 1000.0)
+            raw_x2 = int(nx2 * w / 1000.0)
+            pad_y = max(1, int((raw_y2 - raw_y1) * crop_pad_frac))
+            pad_x = max(1, int((raw_x2 - raw_x1) * crop_pad_frac))
+            y1 = max(0, raw_y1 - pad_y)
+            x1 = max(0, raw_x1 - pad_x)
+            y2 = min(h, raw_y2 + pad_y)
+            x2 = min(w, raw_x2 + pad_x)
         else:
-            crop_rgb = rgb_image
-            crop_depth = depth_frame
-            crop_offset = (0, 0)
+            y1, x1, y2, x2 = 0, 0, h, w
+
+        # Build visibility mask: target object + any sub-component whose centroid
+        # falls inside the (padded) crop region.
+        if object_mask is not None and object_mask.shape == (h, w):
+            vis_mask = object_mask.astype(bool)
+            if all_masks:
+                for oid, m in all_masks.items():
+                    if oid == object_id:
+                        continue
+                    if m.shape != (h, w):
+                        continue
+                    m_bool = m.astype(bool)
+                    ys, xs = np.where(m_bool)
+                    if ys.size == 0:
+                        continue
+                    cy, cx = float(ys.mean()), float(xs.mean())
+                    if y1 <= cy < y2 and x1 <= cx < x2:
+                        vis_mask = vis_mask | m_bool
+            masked_rgb = rgb_image.copy()
+            masked_rgb[~vis_mask] = 0
+        else:
+            masked_rgb = rgb_image
+
+        # Draw a crosshair marker at the specified pixel so Molmo has a visual
+        # anchor for relative spatial reasoning (e.g. "where is the hinge
+        # relative to the gripper contact point shown by the marker?").
+        if mark_pixel_yx is not None:
+            mark_row, mark_col = int(round(mark_pixel_yx[0])), int(round(mark_pixel_yx[1]))
+            if 0 <= mark_row < h and 0 <= mark_col < w:
+                # Work on a copy so we don't mutate the caller's array.
+                if masked_rgb is rgb_image:
+                    masked_rgb = rgb_image.copy()
+                r = max(6, min(20, h // 40))   # crosshair arm length, ~2.5% of frame height
+                t = max(2, r // 4)             # line thickness
+                # Bright yellow crosshair with a dark border for contrast on any background.
+                for dr in range(-r, r + 1):
+                    for dt in range(-t, t + 1):
+                        # horizontal arm
+                        rr, cc = mark_row + dt, mark_col + dr
+                        if 0 <= rr < h and 0 <= cc < w:
+                            masked_rgb[rr, cc] = [0, 0, 0]
+                        # vertical arm
+                        rr, cc = mark_row + dr, mark_col + dt
+                        if 0 <= rr < h and 0 <= cc < w:
+                            masked_rgb[rr, cc] = [0, 0, 0]
+                inner = max(1, t - 1)
+                for dr in range(-r + 1, r):
+                    for dt in range(-inner, inner + 1):
+                        rr, cc = mark_row + dt, mark_col + dr
+                        if 0 <= rr < h and 0 <= cc < w:
+                            masked_rgb[rr, cc] = [255, 230, 0]
+                        rr, cc = mark_row + dr, mark_col + dt
+                        if 0 <= rr < h and 0 <= cc < w:
+                            masked_rgb[rr, cc] = [255, 230, 0]
+
+        # Draw the target object bounding box on the image before cropping so
+        # Molmo sees a clear boundary distinguishing the target from neighbours.
+        if bounding_box_2d is not None and len(bounding_box_2d) == 4:
+            if masked_rgb is rgb_image:
+                masked_rgb = rgb_image.copy()
+            bx1, bx2 = max(0, raw_x1), min(w - 1, raw_x2)
+            by1, by2 = max(0, raw_y1), min(h - 1, raw_y2)
+            t = max(2, h // 200)  # border thickness ~0.5% of frame height
+            masked_rgb[by1:by1 + t, bx1:bx2] = [255, 255, 0]
+            masked_rgb[by2 - t:by2, bx1:bx2] = [255, 255, 0]
+            masked_rgb[by1:by2, bx1:bx1 + t] = [255, 255, 0]
+            masked_rgb[by1:by2, bx2 - t:bx2] = [255, 255, 0]
+
+        # Crop after all drawing so the saved debug image matches what Molmo sees.
+        crop_rgb = masked_rgb[y1:y2, x1:x2]
+        crop_depth = depth_frame[y1:y2, x1:x2] if depth_frame is not None else None
+        crop_offset = (y1, x1)
 
         if crop_rgb.size == 0:
-            crop_rgb = rgb_image
+            crop_rgb = masked_rgb
             crop_depth = depth_frame
             crop_offset = (0, 0)
 
@@ -317,7 +382,7 @@ class MolmoPointDetector:
         for action in actions:
             custom_prompt = custom_prompts.get(action)
             try:
-                ip = self._query_single(
+                ip, input_image_bytes = self._query_single(
                     crop_rgb=crop_rgb,
                     crop_depth=crop_depth,
                     full_depth=depth_frame,
@@ -332,6 +397,7 @@ class MolmoPointDetector:
                 if ip is not None:
                     ip.approach_orientation = approach_orientation
                     ip.approach_vector = approach_vector
+                    ip.input_image_bytes = input_image_bytes
                     result[action] = ip
             except Exception as exc:
                 self.logger.warning(
@@ -356,8 +422,13 @@ class MolmoPointDetector:
         action: str,
         robot_state: Optional[Dict[str, Any]],
         custom_prompt: Optional[str] = None,
-    ) -> Optional[InteractionPoint]:
-        """Run one Molmo2 forward pass for a single action, return InteractionPoint."""
+    ) -> Tuple[Optional["InteractionPoint"], Optional[bytes]]:
+        """Run one Molmo2 forward pass for a single action.
+
+        Returns:
+            (InteractionPoint or None, PNG bytes of the image sent to Molmo)
+        """
+        import io as _io
         import torch
         from PIL import Image as _PIL
 
@@ -367,6 +438,9 @@ class MolmoPointDetector:
             prompt_text = _make_action_prompt(action, object_type)
 
         pil_image = _PIL.fromarray(crop_rgb.astype(np.uint8))
+        _buf = _io.BytesIO()
+        pil_image.save(_buf, format="PNG")
+        input_image_bytes = _buf.getvalue()
         crop_h, crop_w = crop_rgb.shape[:2]
 
         messages = [
@@ -392,6 +466,7 @@ class MolmoPointDetector:
             for k, v in inputs.items()
         }
 
+        torch.cuda.empty_cache()
         with torch.inference_mode():
             generated_ids = self._model.generate(**inputs, max_new_tokens=200)
 
@@ -410,7 +485,7 @@ class MolmoPointDetector:
                 prompt_text,
                 generated_text,
             )
-            return None
+            return None, input_image_bytes
 
         # First point → primary; remainder → alternatives.
         # Convert crop-relative pixel coords back to full-frame pixel coords.
@@ -444,7 +519,7 @@ class MolmoPointDetector:
             position_2d=norm_2d,
             position_3d=position_3d,
             alternative_points=alternative_points,
-        )
+        ), input_image_bytes
 
 
 # ---------------------------------------------------------------------------

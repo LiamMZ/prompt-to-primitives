@@ -22,6 +22,7 @@ class InteractionPoint:
     alternative_points: List[Dict[str, Any]] = field(default_factory=list)
     approach_orientation: Optional[str] = None  # "top_down", "side", or encoded vector
     approach_vector: Optional[np.ndarray] = None
+    input_image_bytes: Optional[bytes] = None   # PNG sent to Molmo (for debug output)
 
 
 @dataclass

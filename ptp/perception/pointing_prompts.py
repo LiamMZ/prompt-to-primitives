@@ -205,14 +205,20 @@ def build_hinge_prompt(
     object_type: str,
     hinge_location: Optional[str] = None,
     action_goal: Optional[str] = None,
+    gripper_pixel_yx: Optional[tuple] = None,
 ) -> str:
-    """Build a hinge/pivot pointing prompt, optionally qualified by location.
+    """Build a hinge/pivot pointing prompt, optionally qualified by location
+    and gripper contact position.
 
     Args:
-        object_type:    Object label, e.g. ``"drawer"``.
-        hinge_location: Spatial description, e.g. ``"left side"``.
-                        When provided it is appended to the prompt.
-        action_goal:    Optional goal, e.g. ``"open"``.
+        object_type:       Object label, e.g. ``"drawer"``.
+        hinge_location:    Spatial description, e.g. ``"left side"``.
+                           When provided it is appended to the prompt.
+        action_goal:       Optional goal, e.g. ``"open"``.
+        gripper_pixel_yx:  ``(row, col)`` pixel where the gripper will contact
+                           the object.  When provided, the prompt tells Molmo
+                           the gripper position so it can localise the hinge
+                           relative to it.
 
     Returns:
         Formatted hinge prompt string.
@@ -222,4 +228,15 @@ def build_hinge_prompt(
     base = template.format(object_type=object_type.replace("_", " "))
     if hinge_location:
         base = base.rstrip(".") + f", located at the {hinge_location}."
+    if gripper_pixel_yx is not None:
+        row, col = gripper_pixel_yx
+        obj = object_type.replace("_", " ")
+
+        base = (
+            base.rstrip(".")
+            + f" The robot gripper will grip the {obj} at"
+            f" approximately pixel ({int(row)}, {int(col)}) (row, col) in this image"
+            f" (marked with a crosshair)."
+            f" Point to the hinge on the opposite side of the {obj} from the grip point."
+        )
     return base

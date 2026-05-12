@@ -56,6 +56,106 @@ _DEFAULT_CATALOG_PATH    = Path(__file__).resolve().parents[2] / "config" / "pri
 logger = logging.getLogger(__name__)
 
 
+def build_labeled_image(color_bytes: bytes, detections: List[Dict[str, Any]]) -> bytes:
+    """Overlay bounding boxes + object ID labels on an RGB snapshot.
+
+    Args:
+        color_bytes: PNG bytes of the source image.
+        detections: List of detection dicts with ``object_id`` and
+                    ``bounding_box_2d`` ([ny1, nx1, ny2, nx2] in 0-1000 scale).
+
+    Returns:
+        PNG bytes with labels rendered over each detected object.
+        Falls back to the original ``color_bytes`` on any rendering error.
+    """
+    import hashlib
+    import io as _io
+    from PIL import Image, ImageDraw, ImageFont
+
+    _PALETTE = [
+        (255, 80, 80), (80, 200, 80), (80, 160, 255), (255, 200, 40),
+        (200, 80, 255), (40, 220, 220), (255, 140, 0), (180, 255, 80),
+    ]
+    try:
+        img  = Image.open(_io.BytesIO(color_bytes)).convert("RGB")
+        draw = ImageDraw.Draw(img, "RGBA")
+        fsz  = max(12, img.width // 60)
+        try:
+            font = ImageFont.load_default(size=fsz)
+        except TypeError:
+            font = ImageFont.load_default()
+
+        iw, ih = img.size
+        pad = 3
+
+        items = []
+        for det in detections:
+            bbox   = det.get("bounding_box_2d")
+            obj_id = det.get("object_id") or det.get("object_type") or "?"
+            if not bbox or len(bbox) < 4:
+                continue
+            ny1, nx1, ny2, nx2 = bbox
+            x1 = int(nx1 / 1000 * iw)
+            y1 = int(ny1 / 1000 * ih)
+            x2 = int(nx2 / 1000 * iw)
+            y2 = int(ny2 / 1000 * ih)
+            if x1 >= x2 or y1 >= y2:
+                continue
+            c = _PALETTE[int(hashlib.md5(obj_id.encode()).hexdigest(), 16) % len(_PALETTE)]
+            try:
+                tb = font.getbbox(obj_id)
+                tw, th = tb[2] - tb[0], tb[3] - tb[1]
+            except Exception:
+                tw, th = len(obj_id) * fsz // 2, fsz
+            items.append((obj_id, x1, y1, x2, y2, c, tw, th))
+
+        occupied: List[Tuple[int, int, int, int]] = []
+
+        def _overlaps(r: Tuple[int, int, int, int]) -> bool:
+            rx1, ry1, rx2, ry2 = r
+            for ox1, oy1, ox2, oy2 in occupied:
+                if rx1 < ox2 and rx2 > ox1 and ry1 < oy2 and ry2 > oy1:
+                    return True
+            return False
+
+        for obj_id, x1, y1, x2, y2, c, tw, th in items:
+            # Bounding box: semi-transparent fill + solid border
+            draw.rectangle([x1, y1, x2, y2], outline=c + (220,), width=2)
+            draw.rectangle([x1, y1, x2, y2], fill=c + (30,))
+
+            # Label chip: prefer top-left corner of box, fall back to centre
+            lw, lh = tw + pad * 2, th + pad * 2
+            candidates = [
+                (x1, y1 - lh),       # above top-left
+                (x1, y1),            # inside top-left
+                (x1, y2),            # below bottom-left
+                ((x1 + x2) // 2 - lw // 2, (y1 + y2) // 2 - lh // 2),  # centre
+            ]
+            chosen = None
+            for lx, ly in candidates:
+                lx = max(0, min(iw - lw, lx))
+                ly = max(0, min(ih - lh, ly))
+                r = (lx, ly, lx + lw, ly + lh)
+                if not _overlaps(r):
+                    chosen = (lx, ly)
+                    occupied.append(r)
+                    break
+            if chosen is None:
+                lx = max(0, min(iw - lw, x1))
+                ly = max(0, min(ih - lh, y1))
+                chosen = (lx, ly)
+            lx, ly = chosen
+            draw.rectangle([lx, ly, lx + lw, ly + lh], fill=c + (220,))
+            draw.text((lx + pad, ly + pad), obj_id, fill=(255, 255, 255), font=font)
+
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception as exc:
+        logger.warning("build_labeled_image failed: %s", exc)
+        return color_bytes
+
+
 class SkillDecomposer:
     """LLM-backed decomposer that maps symbolic actions to executable primitives.
 
@@ -138,14 +238,19 @@ class SkillDecomposer:
         parameters: Dict[str, Any],
         world_hint: Optional[Dict[str, Any]] = None,
         temperature: float = 0.1,
+        high_level_action: str = "",
+        target_object_id: Optional[str] = None,
+        labeled_image_bytes: Optional[bytes] = None,
     ) -> SkillPlan:
         """Decompose a symbolic action into a validated SkillPlan.
 
         Args:
-            action_name: Symbolic action name (e.g., "pick", "place", "displace").
-            parameters: Action parameters (e.g., {"objects": ["rubber_duck_1"]}).
+            action_name: Description of the action (e.g. the ParsedAction.description).
+            parameters: Action parameters (e.g., {"object_id": "cup_1"}).
             world_hint: Optional world-state dict override; merged over live state.
             temperature: LLM temperature.
+            high_level_action: Terse action verb from TaskParser (e.g. "open", "switch_on").
+            target_object_id: Resolved object_id from TaskParser.
 
         Returns:
             Validated SkillPlan ready for PrimitiveExecutor.
@@ -165,14 +270,26 @@ class SkillDecomposer:
         )
         prompts    = self._load_prompts()
         prompt     = self._build_prompt(action_name, parameters, world_state,
-                                        catalog_text, artifacts, prompts["template"])
-        media      = self._build_media_parts(artifacts, world_state.get("latest_detections") or [])
+                                        catalog_text, artifacts, prompts["template"],
+                                        high_level_action=high_level_action,
+                                        target_object_id=target_object_id)
+        detections = world_state.get("latest_detections") or []
+        if labeled_image_bytes is None:
+            labeled_image_bytes = (
+                self._build_labeled_image(artifacts.color_bytes, detections)
+                if artifacts.color_bytes else None
+            )
+        media      = self._build_media_parts(artifacts, detections, img_bytes=labeled_image_bytes)
         raw        = self._call_llm(prompt, temperature=temperature,
                                     media_parts=media, response_schema=prompts["response_schema"])
+        logger.info("Raw LLM response:\n%s", raw)
 
         plan = self._parse_plan(raw, action_name=action_name, registry_hash=registry_hash)
         plan.source_snapshot_id = artifacts.snapshot_id
         plan.raw_llm_response = raw
+        plan.high_level_action = high_level_action
+        plan.target_object_id = target_object_id
+        plan.planner_image_bytes = labeled_image_bytes  # type: ignore[attr-defined]
         self._post_process_plan(plan, world_state, artifacts)
         return plan
 
@@ -283,6 +400,8 @@ class SkillDecomposer:
         catalog_text: str,
         artifacts: SnapshotArtifacts,
         template: str,
+        high_level_action: str = "",
+        target_object_id: Optional[str] = None,
     ) -> str:
         registry  = world_state.get("registry", {})
         relevant  = world_state.get("relevant_objects") or registry.get("objects", [])
@@ -309,6 +428,8 @@ class SkillDecomposer:
         substitutions = {
             "{primitive_catalog}":   catalog_text.strip(),
             "{action_name}":         action_name,
+            "{high_level_action}":   high_level_action or "(not specified)",
+            "{target_object_id}":    target_object_id or "(not specified)",
             "{action_parameters}":   action_schema["parameters"],
             "{action_description}":  action_schema["description"],
             "{parameters}":          json.dumps(parameters, ensure_ascii=True),
@@ -508,10 +629,12 @@ class SkillDecomposer:
         self,
         artifacts: SnapshotArtifacts,
         detections: List[Dict[str, Any]],
+        img_bytes: Optional[bytes] = None,
     ) -> List[Any]:
         if not artifacts.color_bytes:
             return []
-        img_bytes = self._build_labeled_image(artifacts.color_bytes, detections)
+        if img_bytes is None:
+            img_bytes = self._build_labeled_image(artifacts.color_bytes, detections)
         if self._llm_client is not None:
             return [ImagePart(data=img_bytes, mime_type="image/png")]
         return [_genai_types.Part.from_bytes(data=img_bytes, mime_type="image/png")]
@@ -519,50 +642,7 @@ class SkillDecomposer:
     def _build_labeled_image(
         self, color_bytes: bytes, detections: List[Dict[str, Any]]
     ) -> bytes:
-        """Overlay bounding boxes + object ID labels on the RGB snapshot."""
-        import hashlib
-        import io as _io
-        from PIL import Image, ImageDraw, ImageFont
-
-        _PALETTE = [
-            (255, 80, 80), (80, 200, 80), (80, 160, 255), (255, 200, 40),
-            (200, 80, 255), (40, 220, 220), (255, 140, 0), (180, 255, 80),
-        ]
-        try:
-            img  = Image.open(_io.BytesIO(color_bytes)).convert("RGB")
-            draw = ImageDraw.Draw(img, "RGBA")
-            fsz  = max(14, img.width // 50)
-            try:
-                font = ImageFont.load_default(size=fsz)
-            except TypeError:
-                font = ImageFont.load_default()
-
-            for det in detections:
-                bbox   = det.get("bounding_box_2d")
-                obj_id = det.get("object_id") or det.get("object_type") or "?"
-                if not bbox or len(bbox) < 4:
-                    continue
-                x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-                if x1 >= x2 or y1 >= y2:
-                    continue
-                c   = _PALETTE[int(hashlib.md5(obj_id.encode()).hexdigest(), 16) % len(_PALETTE)]
-                draw.rectangle([x1, y1, x2, y2], outline=c + (220,), width=3, fill=c + (40,))
-                try:
-                    tb  = font.getbbox(obj_id)
-                    tw, th = tb[2] - tb[0], tb[3] - tb[1]
-                except Exception:
-                    tw, th = len(obj_id) * fsz // 2, fsz
-                pad = 4
-                lx, ly = x1, max(0, y1 - th - pad * 2)
-                draw.rectangle([lx, ly, lx + tw + pad * 2, ly + th + pad * 2], fill=c + (220,))
-                draw.text((lx + pad, ly + pad), obj_id, fill=(255, 255, 255), font=font)
-
-            buf = _io.BytesIO()
-            img.save(buf, format="PNG")
-            return buf.getvalue()
-        except Exception as exc:
-            logger.warning("_build_labeled_image failed: %s", exc)
-            return color_bytes
+        return build_labeled_image(color_bytes, detections)
 
     def _load_snapshot_detections(self, snapshot_id: Optional[str]) -> List[Dict[str, Any]]:
         if not snapshot_id:

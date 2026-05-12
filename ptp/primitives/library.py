@@ -44,15 +44,13 @@ PRIMITIVE_LIBRARY: Dict[str, PrimitiveSchema] = {
     ),
 
     # ------------------------------------------------------------------
-    # push_pull — constrained EEF motion along/about a surface
+    # push — move EEF into a surface (along -normal)
     # ------------------------------------------------------------------
-    "push_pull": PrimitiveSchema(
-        name="push_pull",
+    "push": PrimitiveSchema(
+        name="push",
         required_params=("surface_label",),
         optional_params=(
-            "force_direction",
             "is_button",
-            "has_pivot",
             "action_goal",
             "speed_factor",
             "execute",
@@ -61,15 +59,36 @@ PRIMITIVE_LIBRARY: Dict[str, PrimitiveSchema] = {
         ),
         allowed_frames=("base", "camera"),
         description=(
-            "Push or pull relative to a named surface or object. "
-            "surface_label: name of the surface/object to interact with. "
-            "force_direction: 'perpendicular' (into surface) or 'parallel' (slide). "
+            "Move the gripper into a surface along the negative surface normal. "
+            "surface_label: target object_id or surface name. "
             "is_button: True for momentary press-and-retract. "
-            "has_pivot: True for revolute (door/drawer) articulation — Molmo locates the hinge automatically. "
-            "metadata: executor-injected dict containing surface_normal_base (set by "
-            "Molmo surface grounding), surface_normal_confidence, surface_pixel_yx; "
-            "and for pivot motions: pivot_point_base (Molmo-grounded hinge 3D position "
-            "in base frame) and pivot_radius_m (lever-arm distance from hinge to contact point)."
+            "action_goal: high-level goal string passed to Molmo (e.g. 'press', 'push'). "
+            "Executor injects surface_normal_base via metadata."
+        ),
+    ),
+
+    # ------------------------------------------------------------------
+    # pull — move EEF away from a surface (along +normal)
+    # ------------------------------------------------------------------
+    "pull": PrimitiveSchema(
+        name="pull",
+        required_params=("surface_label",),
+        optional_params=(
+            "has_pivot",
+            "hinge_axis",
+            "action_goal",
+            "speed_factor",
+            "execute",
+            "metadata",
+            "object_id",
+        ),
+        allowed_frames=("base", "camera"),
+        description=(
+            "Move the gripper away from a surface along the positive surface normal. "
+            "surface_label: target object_id or surface name. "
+            "has_pivot: True for revolute articulation (door/drawer) — Molmo locates the hinge automatically. "
+            "action_goal: high-level goal string passed to Molmo (e.g. 'open', 'pull'). "
+            "Executor injects surface_normal_base and pivot metadata."
         ),
     ),
 

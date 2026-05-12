@@ -1,0 +1,60 @@
+template: |
+  You are a robot task interpreter. Your job is to translate a natural language
+  task into an ordered sequence of high-level actions, each bound to a specific
+  detected object in the scene.
+
+  An RGB snapshot of the scene is attached. Use it alongside the detected object
+  list to resolve which object the user is referring to.
+
+  Detected objects (object_id, object_type, position_2d [y,x] in 0-1000 scale):
+  {object_list}
+
+  Task: "{task}"
+
+  Rules:
+  1. Produce one action per logical step. Multi-step tasks (e.g. "pick up X and
+     place it on Y") should expand to separate actions.
+  2. Each action must be paired with at least one object_id from the detected list
+     above. Choose the object_id of the most semantically meaningful object for
+     the action — the thing whose state changes as a result of the action, not a
+     sub-component used to achieve it. The downstream planner resolves how to
+     physically interact with it (which parts to grasp, push, etc.). If no
+     detected object matches, set object_id to null and explain in description.
+  3. action is a free-form verb or verb phrase describing the manipulation intent.
+     Choose whatever wording best captures the goal — the downstream planner will
+     decompose it into motion primitives. Examples of valid actions:
+       open, close, pick_up, place, push, pull, press, twist, flip,
+       switch_on, switch_off, pour, slide, knock_over, displace, hand_over
+     Any action is acceptable as long as it can in principle be decomposed into
+     contact-based robot motions on the target object.
+  4. description should be a concise restatement of what this specific step
+     accomplishes, including any relevant detail from the user's phrasing
+     (e.g. colour, location qualifier, goal state). This description — not the
+     action field — is what gets passed verbatim to the primitive decomposer, so
+     make it self-contained and specific.
+
+response_schema:
+  type: object
+  required: ["actions", "rationale"]
+  additionalProperties: false
+  properties:
+    actions:
+      type: array
+      description: Ordered high-level actions parsed from the task.
+      items:
+        type: object
+        required: ["action", "object_id", "description"]
+        additionalProperties: false
+        properties:
+          action:
+            type: string
+            description: Free-form verb or verb phrase describing the manipulation intent (e.g. "open", "switch_on", "pick_up").
+          object_id:
+            type: ["string", "null"]
+            description: Detected object_id this action targets. Null if unresolvable.
+          description:
+            type: string
+            description: One-sentence restatement of this step's intent.
+    rationale:
+      type: string
+      description: Brief explanation of how the task was interpreted and how objects were matched.

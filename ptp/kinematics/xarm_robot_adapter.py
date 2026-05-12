@@ -85,6 +85,73 @@ class XArmRobotAdapter:
             return True
         return False
 
+    def cartesian_move(
+        self,
+        position: List[float],
+        orientation_quat_xyzw: List[float],
+        speed: float = 50.0,
+        acc: float = 500.0,
+        wait: bool = True,
+    ) -> bool:
+        """Move TCP directly to a Cartesian pose via xArm set_position (mm + rad).
+
+        Args:
+            position: [x, y, z] in metres (converted to mm internally).
+            orientation_quat_xyzw: quaternion [x, y, z, w].
+            speed: linear speed in mm/s.
+            acc: linear acceleration in mm/s².
+        """
+        from scipy.spatial.transform import Rotation
+        x_mm, y_mm, z_mm = [v * 1000.0 for v in position]
+        roll, pitch, yaw = Rotation.from_quat(orientation_quat_xyzw).as_euler("xyz")
+        with self.arm_lock:
+            self.arm.set_mode(0)
+            self.arm.set_state(0)
+            code = self.arm.set_position(
+                x=x_mm, y=y_mm, z=z_mm,
+                roll=roll, pitch=pitch, yaw=yaw,
+                speed=speed, mvacc=acc,
+                is_radian=True, wait=wait,
+            )
+        return code == 0
+
+    def cartesian_arc(
+        self,
+        waypoints: List[tuple],
+        speed: float = 30.0,
+        acc: float = 200.0,
+    ) -> bool:
+        """Send a sequence of Cartesian poses as a smooth arc motion.
+
+        Sets mode/state once before the loop, then streams waypoints with
+        wait=False on intermediate steps and wait=True on the final step,
+        giving smooth continuous motion without controller resets.
+
+        Args:
+            waypoints: List of (position_m, quaternion_xyzw) tuples.
+            speed: linear speed in mm/s.
+            acc: linear acceleration in mm/s².
+        """
+        from scipy.spatial.transform import Rotation
+        if not waypoints:
+            return True
+        with self.arm_lock:
+            self.arm.set_mode(0)
+            self.arm.set_state(0)
+            for i, (pos, quat) in enumerate(waypoints):
+                x_mm, y_mm, z_mm = [v * 1000.0 for v in pos]
+                roll, pitch, yaw = Rotation.from_quat(quat).as_euler("xyz")
+                is_last = (i == len(waypoints) - 1)
+                code = self.arm.set_position(
+                    x=x_mm, y=y_mm, z=z_mm,
+                    roll=roll, pitch=pitch, yaw=yaw,
+                    speed=speed, mvacc=acc,
+                    is_radian=True, wait=is_last,
+                )
+                if code != 0:
+                    return False
+        return True
+
     def open_gripper(self, wait: bool = True, **_: Any) -> bool:
         """Open the xArm gripper."""
         return self._set_gripper(_GRIPPER_OPEN, wait=wait)

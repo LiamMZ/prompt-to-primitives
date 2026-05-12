@@ -9,7 +9,9 @@ Two fitting methods are supported:
   ransac — robust to outliers, better for noisy or mixed-surface patches
 
 The returned normal always points toward the camera (positive-Z in camera
-frame) so it can be directly negated to get the push-into-surface direction.
+frame).  The wrist camera faces outward toward the scene, so +Z camera points
+away from the robot into the scene — i.e. the normal points INTO the surface
+from the robot's perspective.  Use +normal to push and -normal to pull.
 """
 
 from __future__ import annotations
