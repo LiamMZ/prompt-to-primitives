@@ -51,11 +51,14 @@ logger = logging.getLogger(__name__)
 
 _DEPTH_MIN_M = 0.15
 _DEPTH_MAX_M = 2.0
-_DEPTH_STRIDE = 4
-_BPA_RADIUS_FACTOR = 2.0       # reduced from 3.0 — tighter ball prevents gap-spanning fins
+_DEPTH_STRIDE = 2              # reduced from 4 — 4× more points, better coverage of small/far objects
+_VOXEL_SIZE_M = 0.003          # downsample to 3 mm grid before BPA to normalise point spacing
+_BPA_RADIUS_FACTOR_OBJ = 1.5   # tighter ball for per-object meshes — prevents gap-spanning fins
+_BPA_RADIUS_FACTOR_BG  = 2.0   # looser ball for background — larger surfaces tolerate more gap
 _BPA_RADIUS_MAX_M = 0.04       # hard cap: ball never spans more than 4 cm
 _LONG_EDGE_FACTOR = 4.0        # triangles whose longest edge > factor × mean_spacing are artifacts
-_MIN_COMPONENT_TRIS = 20       # connected components smaller than this are noise islands
+_MIN_COMPONENT_TRIS_RATIO = 0.02  # min component size as fraction of total triangles (floor: 8)
+_MIN_COMPONENT_TRIS_FLOOR = 8  # absolute minimum — avoids pruning everything on small objects
 _OUTLIER_NB_POINTS = 16        # statistical outlier removal neighbour count
 _OUTLIER_STD_RATIO = 1.5       # points beyond mean + ratio×std are removed
 _COLLISION_MARGIN_M = 0.005
@@ -632,7 +635,7 @@ class DepthEnvironmentCollider:
                          label, len(pts) if pts is not None else 0)
             return False
 
-        mesh = self._points_to_mesh(pts)
+        mesh = self._points_to_mesh(pts, is_background=(label == BACKGROUND_ID))
         if mesh is None:
             logger.debug("DepthEnvironmentCollider: mesh failed for %s", label)
             return False
@@ -648,12 +651,18 @@ class DepthEnvironmentCollider:
         )
         return True
 
-    def _points_to_mesh(self, pts: np.ndarray) -> Optional[object]:
+    def _points_to_mesh(self, pts: np.ndarray, is_background: bool = False) -> Optional[object]:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts)
 
-        # Remove statistical outliers before reconstruction — eliminates isolated
-        # noise points at depth edges that BPA would otherwise bridge into phantom triangles.
+        # Voxel downsample to a uniform 3 mm grid so BPA ball radius is consistent
+        # regardless of object distance or stride density variation.
+        pcd = pcd.voxel_down_sample(_VOXEL_SIZE_M)
+        if len(pcd.points) < 10:
+            return None
+
+        # Remove statistical outliers — eliminates isolated noise points at depth
+        # edges that BPA would otherwise bridge into phantom triangles.
         pcd, _ = pcd.remove_statistical_outlier(
             nb_neighbors=_OUTLIER_NB_POINTS,
             std_ratio=_OUTLIER_STD_RATIO,
@@ -673,7 +682,8 @@ class DepthEnvironmentCollider:
         if len(distances) == 0:
             return None
         mean_spacing = float(np.mean(distances))
-        radius = min(_BPA_RADIUS_FACTOR * mean_spacing, _BPA_RADIUS_MAX_M)
+        bpa_factor = _BPA_RADIUS_FACTOR_BG if is_background else _BPA_RADIUS_FACTOR_OBJ
+        radius = min(bpa_factor * mean_spacing, _BPA_RADIUS_MAX_M)
 
         mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
             pcd,
@@ -695,21 +705,24 @@ class DepthEnvironmentCollider:
             np.linalg.norm(v1 - v0, axis=1),
             np.maximum(np.linalg.norm(v2 - v1, axis=1), np.linalg.norm(v0 - v2, axis=1)),
         )
-        remove = np.where(longest > max_edge)[0]
-        mesh.remove_triangles_by_index(remove.tolist())
+        mesh.remove_triangles_by_index(np.where(longest > max_edge)[0].tolist())
         mesh.remove_unreferenced_vertices()
         if len(mesh.triangles) == 0:
             return None
 
         # Remove small disconnected components — noise islands left after edge filtering.
+        # Threshold scales with total triangle count so small objects aren't over-pruned.
         triangle_clusters, cluster_n_tris, _ = mesh.cluster_connected_triangles()
         triangle_clusters = np.asarray(triangle_clusters)
         cluster_n_tris = np.asarray(cluster_n_tris)
-        keep_clusters = set(int(i) for i, n in enumerate(cluster_n_tris) if n >= _MIN_COMPONENT_TRIS)
+        total_tris = int(cluster_n_tris.sum())
+        min_tris = max(_MIN_COMPONENT_TRIS_FLOOR, int(total_tris * _MIN_COMPONENT_TRIS_RATIO))
+        keep_clusters = set(int(i) for i, n in enumerate(cluster_n_tris) if n >= min_tris)
         if not keep_clusters:
             return None
-        remove_tris = np.where(~np.isin(triangle_clusters, list(keep_clusters)))[0]
-        mesh.remove_triangles_by_index(remove_tris.tolist())
+        mesh.remove_triangles_by_index(
+            np.where(~np.isin(triangle_clusters, list(keep_clusters)))[0].tolist()
+        )
         mesh.remove_unreferenced_vertices()
         if len(mesh.triangles) == 0:
             return None

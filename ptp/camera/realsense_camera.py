@@ -59,6 +59,8 @@ class RealSenseCamera(BaseCamera):
         enable_depth: bool = True,
         auto_start: bool = True,
         logger: Optional[logging.Logger] = None,
+        color_exposure: int = 250,
+        depth_exposure: int = -1,
     ) -> None:
         if not REALSENSE_AVAILABLE:
             raise ImportError(
@@ -69,6 +71,8 @@ class RealSenseCamera(BaseCamera):
         self.height = height
         self.fps = fps
         self.enable_depth = enable_depth
+        self.color_exposure = color_exposure
+        self.depth_exposure = depth_exposure
         self.logger = logger or get_structured_logger("RealSenseCamera")
 
         self.pipeline: Optional[rs.pipeline] = None
@@ -122,6 +126,7 @@ class RealSenseCamera(BaseCamera):
                 self.profile = self.pipeline.start(self.config)
                 self._start_time = time.time()
                 self.logger.info("RealSense pipeline started (cycle %d/%d)", cycle, _MAX_CYCLES)
+                self._set_fixed_exposure(self.color_exposure, self.depth_exposure)
                 attempt = self._wait_for_initial_frames(max_retries=30, retry_delay=0.1, timeout_ms=1000)
                 self.logger.info(
                     "Camera ready (first valid frame on attempt %d)", attempt
@@ -274,6 +279,24 @@ class RealSenseCamera(BaseCamera):
 
         self.hole_filling = rs.hole_filling_filter()
         self.hole_filling.set_option(rs.option.holes_fill, 1)
+
+    def _set_fixed_exposure(self, color_exposure: int, depth_exposure: int) -> None:
+        """Set exposure for both sensors. A value of -1 leaves auto-exposure enabled."""
+        for sensor_getter, label, value in [
+            ("first_color_sensor", "color", color_exposure),
+            ("first_depth_sensor", "depth", depth_exposure),
+        ]:
+            try:
+                sensor = getattr(self.profile.get_device(), sensor_getter)()
+                if value == -1:
+                    sensor.set_option(rs.option.enable_auto_exposure, 1)
+                    self.logger.info("%s sensor exposure set to auto", label)
+                else:
+                    sensor.set_option(rs.option.enable_auto_exposure, 0)
+                    sensor.set_option(rs.option.exposure, float(value))
+                    self.logger.info("%s sensor exposure set to %d (auto-exposure disabled)", label, value)
+            except Exception as exc:
+                self.logger.warning("Could not set exposure for %s sensor: %s", label, exc)
 
     def _wait_for_initial_frames(
         self,

@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 
 from .object_registry import InteractionPoint
-from .utils.coordinates import compute_3d_position, pixel_to_normalized
+from .utils.coordinates import compute_3d_position, compute_3d_position_masked, pixel_to_normalized
 
 logger = logging.getLogger(__name__)
 
@@ -334,11 +334,16 @@ class MolmoPointDetector:
 
         # Draw the target object bounding box on the image before cropping so
         # Molmo sees a clear boundary distinguishing the target from neighbours.
+        # The box is drawn with a small outward padding so it sits just outside
+        # the object silhouette rather than overlapping it.
         if bounding_box_2d is not None and len(bounding_box_2d) == 4:
             if masked_rgb is rgb_image:
                 masked_rgb = rgb_image.copy()
-            bx1, bx2 = max(0, raw_x1), min(w - 1, raw_x2)
-            by1, by2 = max(0, raw_y1), min(h - 1, raw_y2)
+            bbox_pad = max(4, h // 120)  # ~0.8% of frame height
+            bx1 = max(0,     raw_x1 - bbox_pad)
+            bx2 = min(w - 1, raw_x2 + bbox_pad)
+            by1 = max(0,     raw_y1 - bbox_pad)
+            by2 = min(h - 1, raw_y2 + bbox_pad)
             t = max(2, h // 200)  # border thickness ~0.5% of frame height
             masked_rgb[by1:by1 + t, bx1:bx2] = [255, 255, 0]
             masked_rgb[by2 - t:by2, bx1:bx2] = [255, 255, 0]
@@ -393,6 +398,7 @@ class MolmoPointDetector:
                     action=action,
                     robot_state=robot_state,
                     custom_prompt=custom_prompt,
+                    object_mask=object_mask if object_mask is not None and object_mask.shape == (h, w) else None,
                 )
                 if ip is not None:
                     ip.approach_orientation = approach_orientation
@@ -422,6 +428,7 @@ class MolmoPointDetector:
         action: str,
         robot_state: Optional[Dict[str, Any]],
         custom_prompt: Optional[str] = None,
+        object_mask: Optional[np.ndarray] = None,
     ) -> Tuple[Optional["InteractionPoint"], Optional[bytes]]:
         """Run one Molmo2 forward pass for a single action.
 
@@ -507,10 +514,10 @@ class MolmoPointDetector:
                 {"position_2d": pixel_to_normalized((apy, apx), full_image_shape)}
             )
 
-        # 3-D back-projection.
+        # 3-D back-projection using mask-constrained median depth.
         position_3d = None
         if full_depth is not None and camera_intrinsics is not None:
-            cam_pos = compute_3d_position(norm_2d, full_depth, camera_intrinsics)
+            cam_pos = compute_3d_position_masked(norm_2d, full_depth, camera_intrinsics, object_mask=object_mask)
             if cam_pos is not None:
                 world_pos = _transform_cam_to_world(cam_pos, robot_state)
                 position_3d = world_pos if world_pos is not None else cam_pos

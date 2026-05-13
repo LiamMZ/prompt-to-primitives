@@ -122,6 +122,62 @@ def project_3d_to_2d(
         return None
 
 
+def compute_3d_position_masked(
+    position_2d: List[int],
+    depth_frame: np.ndarray,
+    camera_intrinsics: Any,
+    object_mask: Optional[np.ndarray] = None,
+    patch_radius: int = 4,
+    depth_percentile: float = 15.0,
+) -> Optional[np.ndarray]:
+    """Back-project a normalised 2D point to 3D using a mask-constrained low-percentile depth.
+
+    When `object_mask` is provided the depth sample is drawn from all valid pixels
+    inside the mask (not just a local patch), and the `depth_percentile`-th percentile
+    is used as Z.  A low percentile (default 15) reliably picks the nearest visible
+    surface of the object rather than the median, which can be pulled toward background
+    pixels on thin or narrow objects where most mask pixels read the surface behind.
+
+    Falls back to a local patch median when no mask is provided or the mask yields
+    no valid depth.
+    """
+    try:
+        h, w = depth_frame.shape[:2]
+        py, px = normalized_to_pixel(position_2d, (h, w))
+
+        fx = getattr(camera_intrinsics, "fx", w / 2)
+        fy = getattr(camera_intrinsics, "fy", h / 2)
+        cx = getattr(camera_intrinsics, "ppx", getattr(camera_intrinsics, "cx", w / 2))
+        cy = getattr(camera_intrinsics, "ppy", getattr(camera_intrinsics, "cy", h / 2))
+
+        # --- Mask path: sample entire object mask, take low percentile ---
+        if object_mask is not None and object_mask.shape == (h, w):
+            mask_depth = depth_frame[object_mask.astype(bool)]
+            valid = mask_depth[(mask_depth > 0) & np.isfinite(mask_depth)]
+            if valid.size > 0:
+                z = float(np.percentile(valid, depth_percentile))
+                x = (px - cx) * z / fx
+                y = (py - cy) * z / fy
+                return np.array([x, y, z], dtype=np.float32)
+
+        # --- Fallback: local patch median (no mask or mask gave nothing) ---
+        r = patch_radius
+        y0, y1 = max(0, py - r), min(h, py + r + 1)
+        x0, x1 = max(0, px - r), min(w, px + r + 1)
+        patch = depth_frame[y0:y1, x0:x1]
+        valid = patch[(patch > 0) & np.isfinite(patch)]
+        if valid.size == 0:
+            return None
+
+        z = float(np.median(valid))
+        x = (px - cx) * z / fx
+        y = (py - cy) * z / fy
+        return np.array([x, y, z], dtype=np.float32)
+
+    except Exception:
+        return None
+
+
 def batch_compute_3d_positions(
     positions_2d: List[List[int]],
     depth_frame: np.ndarray,

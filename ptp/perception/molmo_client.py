@@ -23,7 +23,7 @@ from .molmo_point_detector import (
     _transform_cam_to_world,
 )
 from .object_registry import InteractionPoint
-from .utils.coordinates import compute_3d_position, pixel_to_normalized
+from .utils.coordinates import compute_3d_position_masked, pixel_to_normalized
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,7 @@ class MolmoClient(MolmoPointDetector):
         action: str,
         robot_state: Optional[Dict[str, Any]],
         custom_prompt: Optional[str] = None,
+        object_mask: Optional[np.ndarray] = None,
     ) -> Tuple[Optional[InteractionPoint], Optional[bytes]]:
         from PIL import Image as _PIL
 
@@ -145,7 +146,7 @@ class MolmoClient(MolmoPointDetector):
 
         position_3d = None
         if full_depth is not None and camera_intrinsics is not None:
-            cam_pos = compute_3d_position(norm_2d, full_depth, camera_intrinsics)
+            cam_pos = compute_3d_position_masked(norm_2d, full_depth, camera_intrinsics, object_mask=object_mask)
             if cam_pos is not None:
                 world_pos = _transform_cam_to_world(cam_pos, robot_state)
                 position_3d = world_pos if world_pos is not None else cam_pos

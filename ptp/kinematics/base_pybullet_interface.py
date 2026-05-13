@@ -479,6 +479,7 @@ class BasePybulletInterface:
             self._joints = sol[:dof]
             reached = self.get_robot_tcp_pose()
             self._joints = saved
+            self._apply_joints_to_sim()  # keep sim in sync so collision_check_fn sees correct state
             if reached is None:
                 continue
 
@@ -801,6 +802,29 @@ class BasePybulletInterface:
         if not OMPL_AVAILABLE:
             logger.warning("OMPL not available — using linear interpolation (no collision checking)")
             return np.linspace(start_joints, goal_joints, num=max(10, interpolate_n), dtype=float)
+
+        # --- Try linear interpolation first ---
+        # Check collision on a coarse 16-waypoint sweep; densify to interpolate_n
+        # only if it passes.  This avoids the full 64-point sweep on every grasp
+        # sampler candidate while still catching obstacles reliably.
+        _CHECK_N = 16
+        check_traj = np.linspace(start_joints, goal_joints, num=_CHECK_N, dtype=float)
+        linear_collision_free = all(
+            self._is_state_valid(wp, env_bodies, floor_body, collision_margin, n_links)
+            for wp in check_traj
+        )
+        # Restore sim to start state after the validity checks.
+        for idx, val in zip(self._movable_joints, full_joint_snapshot):
+            p.resetJointState(self._robot_id, idx, float(val), physicsClientId=self._physics_client)
+        if linear_collision_free:
+            linear_traj = np.linspace(start_joints, goal_joints, num=max(10, interpolate_n), dtype=float)
+            logger.debug(
+                "Linear interpolation is collision-free — skipping OMPL (%d waypoints)",
+                linear_traj.shape[0],
+            )
+            return _clamp_waypoint_steps(linear_traj, max_joint_step=np.pi / 8)
+
+        logger.debug("Linear interpolation collides — falling back to OMPL BITstar")
 
         # --- OMPL setup ---
         space = ob.RealVectorStateSpace(dof)
