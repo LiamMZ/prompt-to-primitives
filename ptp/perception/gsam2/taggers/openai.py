@@ -1,57 +1,50 @@
 """OpenAI vision-based object tagger."""
 
-import base64
 import io
 import json
+from pathlib import Path
+from typing import Optional, Tuple
+
 import numpy as np
+import yaml
 from PIL import Image
 
 from .base import BaseTagger
+from ptp.llm_interface.base import GenerateConfig, ImagePart, LLMClient
 
-_DEFAULT_MODEL = "gpt-4o-mini"
-
-_SYSTEM_PROMPT_BASE = (
-    "You are a robotics perception system. "
-    "Given an image, list every distinct object you can see that a robot could interact with. "
-    "Rules:\n"
-    "- Prefer a single generic noun per entry (e.g. 'cube', 'mug', 'bottle', 'table').\n"
-    "- If multiple instances of the same category are visually distinct (e.g. different colors or "
-    "materials), give each its own entry with a qualifying adjective "
-    "(e.g. 'red block', 'blue block' rather than just 'block').\n"
-    "- Do not emit duplicate entries — every tag in the list must be unique.\n"
-    "- Omit vague words like 'object', 'item', 'thing', 'surface', 'background'.\n"
-    'Respond with a JSON object in this exact format: {"tags": ["tag1", "tag2"]}'
-)
+_DEFAULT_PROMPTS_PATH = Path(__file__).resolve().parents[4] / "config" / "tagger_prompts.yaml"
 
 
 class OpenAITagger(BaseTagger):
-    """
-    Tagger that uses an OpenAI vision model to generate object labels from an RGB image.
+    """Tagger that uses an LLMClient to generate object labels from an RGB image.
 
     Produces a GroundingDINO-ready prompt string from the model's response.
+    The system prompt is loaded from config/tagger_prompts.yaml so it can be
+    edited without touching code.
 
     Args:
-        api_key: OpenAI API key. If omitted, the SDK reads ``OPENAI_API_KEY`` from env.
-        model: OpenAI model ID (default: ``"gpt-4o-mini"``).
-        max_tokens: Maximum tokens in the model response (default: 256).
+        llm_client: Any ptp.llm_interface.LLMClient implementation.
+        prompts_config_path: Override path to the YAML prompt config.
     """
 
     def __init__(
         self,
-        api_key: str | None = None,
-        model: str = _DEFAULT_MODEL,
-        max_tokens: int = 256,
-    ):
-        try:
-            from openai import OpenAI
-        except ImportError as e:
-            raise ImportError(
-                "openai is required. Install with: pip install openai"
-            ) from e
+        llm_client: LLMClient,
+        prompts_config_path: Optional[Path] = None,
+    ) -> None:
+        self._llm_client = llm_client
+        self._prompts_path = Path(prompts_config_path or _DEFAULT_PROMPTS_PATH)
+        self._prompts_cache: Optional[dict] = None
+        self._prompts_mtime: float = 0.0
 
-        self._model = model
-        self._max_tokens = max_tokens
-        self._client = OpenAI(api_key=api_key)
+    def _load_prompts(self) -> dict:
+        mtime = self._prompts_path.stat().st_mtime
+        if self._prompts_cache is not None and mtime == self._prompts_mtime:
+            return self._prompts_cache
+        data = yaml.safe_load(self._prompts_path.read_text()) or {}
+        self._prompts_cache = data
+        self._prompts_mtime = mtime
+        return data
 
     @staticmethod
     def _tags_to_prompt(tags: list[str]) -> str:
@@ -65,63 +58,51 @@ class OpenAITagger(BaseTagger):
         return " ".join(t + "." for t in unique)
 
     @staticmethod
-    def _encode_image(rgb_image: np.ndarray) -> str:
+    def _encode_image(rgb_image: np.ndarray) -> bytes:
         buf = io.BytesIO()
         Image.fromarray(rgb_image).save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue()).decode("utf-8")
+        return buf.getvalue()
 
     def tag(
         self,
         rgb_image: np.ndarray,
         required_tags: list[str] | None = None,
-    ) -> tuple[str, str]:
-        """
-        Run the OpenAI vision model on *rgb_image* and return ``(prompt_str, raw_str)``.
+    ) -> Tuple[str, str]:
+        """Run the LLM on *rgb_image* and return ``(prompt_str, raw_str)``.
 
         Args:
             rgb_image: ``(H, W, 3)`` uint8 numpy array in RGB order.
-            required_tags: Object names that must appear in the output (e.g. goal objects
-                from the current task). These are appended to the system prompt so the
-                model is explicitly told to look for them.
+            required_tags: Object names that must appear in the output (e.g. goal
+                objects from the current task).
 
         Returns:
             ``(prompt_str, raw_str)`` where *prompt_str* is a period-separated label
-            string suitable for GroundingDINO and *raw_str* is the raw JSON response
-            text from the model.
+            string suitable for GroundingDINO and *raw_str* is the raw JSON response.
         """
-        b64 = self._encode_image(rgb_image)
-
-        system_prompt = _SYSTEM_PROMPT_BASE
+        prompts = self._load_prompts()
+        system_prompt = prompts.get("system_prompt", "").strip()
         if required_tags:
             required_str = ", ".join(f"'{t}'" for t in required_tags)
-            system_prompt += (
-                f"\nAdditionally, you should look for the following task-relevant objects "
-                f"in your response if they are present in the image: {required_str}."
-            )
+            suffix = prompts.get("required_tags_suffix", "").strip()
+            system_prompt += "\n" + suffix.format(required_tags=required_str)
 
-        response = self._client.chat.completions.create(
-            model=self._model,
-            max_tokens=self._max_tokens,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{b64}"},
-                        }
-                    ],
-                },
-            ],
+        img_bytes = self._encode_image(rgb_image)
+        config = GenerateConfig(
+            system_instruction=system_prompt,
+            temperature=0.2,
+            max_output_tokens=256,
+            response_mime_type="application/json",
         )
-
-        raw = response.choices[0].message.content or ""
+        response = self._llm_client.generate(
+            [ImagePart(data=img_bytes, mime_type="image/png")],
+            config=config,
+        )
+        raw = response.text or ""
 
         try:
             parsed = json.loads(raw)
             tags = parsed.get("tags", [])
-            self.logger.info(f"OpenAI tags: {tags}")
+            self.logger.info("OpenAITagger tags: %s", tags)
         except json.JSONDecodeError:
             self.logger.warning("OpenAITagger: failed to parse JSON response: %r", raw)
             tags = []

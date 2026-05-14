@@ -26,12 +26,17 @@ template: |
   1. Use ONLY primitive names from the catalog. Any other name causes a hard failure.
 
   2. move_gripper_to_pose — pointing_guidance (required):
-     Set `metadata.pointing_guidance` to a "Point to …" instruction that is sent
-     verbatim to Molmo2. Molmo clicks that sub-region, so be geometrically specific.
-     Always begin with "Point to" and describe the exact contact region:
-     - pick / displace:  "Point to the cylindrical body of the red cup midway between base and rim"
-     - place:            "Point to the flat table surface 10 cm left of the blue cup"
-     - open/close:       "Point to the drawer handle grip bar at its midpoint"
+     Set `metadata.pointing_guidance` to a "Point to …" instruction sent verbatim to
+     Molmo2. The instruction must combine TWO things: (a) the best grasp surface on the
+     object, and (b) the action being performed. This lets Molmo choose the right contact
+     point for the specific goal, not just the nearest surface.
+
+     Template: "Point to the best place to <action verb> the <object_type> to <complete the goal>."
+
+     The point MUST land on the physical surface of the target object — never in the air,
+     behind it, or on a neighbouring object. Do NOT describe where the object is in the
+     scene — describe the intended interaction with the object itself.
+
      Do NOT set target_pixel_yx or preset_orientation — the executor resolves those.
      Set `metadata.approach_direction`: "top_down" for open surfaces and flat tops;
      "side" for handles, knobs, vertical faces, or overhead-obstructed items.
@@ -44,27 +49,38 @@ template: |
      Set `action_goal` to clarify intent for Molmo (e.g. "press", "push", "open", "pull").
 
      push: moves the gripper ALONG -normal (into the surface).
-       Use for: pressing buttons, pushing objects, closing drawers/doors.
+       Use for: pressing actuatable surfaces, pushing objects, closing articulated parts.
        Set `is_button: true` for momentary press-and-retract.
 
      pull: moves the gripper ALONG +normal (away from the surface).
-       Use for: opening drawers, pulling handles, opening doors.
-       Set `has_pivot: true` for revolute joints (door/drawer hinges) —
-       Molmo locates the hinge automatically.
-       Set `hinge_axis: "vertical"` for side-hinged doors (hinge on left or right edge,
-       door swings left/right). Set `hinge_axis: "horizontal"` for top- or bottom-hinged
-       lids/flaps (hinge on top or bottom edge, door swings up/down). Null if unknown.
+       Use for: pulling handles, extracting objects, opening articulated parts.
+       Set `has_pivot: true` ONLY when the object physically rotates around a fixed
+       hinge axis. DO NOT set has_pivot for any motion where the object translates
+       rather than rotates. For all linear pulls, leave has_pivot null.
+       Set `hinge_axis: "vertical"` when the hinge is on a vertical edge (object swings
+       left/right). Set `hinge_axis: "horizontal"` when the hinge is on a horizontal
+       edge (object swings up/down). Null if unknown or if has_pivot is null.
 
   4. move_gripper_to_pose ONLY moves the arm — it does NOT open or close the gripper.
      Always pair it with explicit open_gripper / close_gripper calls:
-       pick sequence:         open_gripper → move_gripper_to_pose (to object) → close_gripper → retract_gripper
-       place sequence:        move_gripper_to_pose (to target, is_place=true) → open_gripper → retract_gripper
-       open door/drawer:      open_gripper → move_gripper_to_pose (to handle) → close_gripper → pull (has_pivot=true) → open_gripper → retract_gripper
-       push/press (no grasp): move_gripper_to_pose (to surface) → push
+       grasp sequence:        open_gripper → move_gripper_to_pose → close_gripper → retract_gripper
+       place sequence:        move_gripper_to_pose (is_place=true) → open_gripper → retract_gripper
+       pull with grasp:       open_gripper → move_gripper_to_pose → close_gripper → pull → open_gripper → retract_gripper
+       push without grasp:    move_gripper_to_pose → push
      Never rely on move_gripper_to_pose to actuate the gripper.
-     Any task that requires PULLING (opening a door, drawer, or handle) MUST include
-     close_gripper before pull so the robot is gripping the handle. Forgetting
-     close_gripper means the robot will swipe through the air and accomplish nothing.
+
+     ⚠ PLACE SAFETY — open_gripper MUST come AFTER move_gripper_to_pose (is_place=true),
+     never before. The gripper must be physically positioned at the destination surface
+     before the object is released. Opening the gripper mid-air or during transit drops
+     the object from height and may break it. The correct invariant is:
+       1. Gripper arrives at destination (move_gripper_to_pose with is_place=true)
+       2. Gripper opens and object is set down (open_gripper)
+       3. Gripper retracts empty (retract_gripper)
+     Inserting open_gripper at any earlier point in this sequence is an error.
+
+     Any task that requires PULLING MUST include close_gripper before pull so the robot
+     is gripping the object. Forgetting close_gripper means the robot will swipe through
+     the air and accomplish nothing.
 
   5. Gripper and motion primitives — pass `{}` for parameters unless overriding defaults:
      open_gripper, close_gripper, retract_gripper, twist.
@@ -127,7 +143,7 @@ response_schema:
                 description: "push only. Momentary press then retract."
               has_pivot:
                 type: ["boolean", "null"]
-                description: "pull only. Revolute articulation (door/drawer) — Molmo locates the hinge."
+                description: "pull only. True ONLY for objects that rotate around a fixed hinge (cabinet doors, hinged lids, oven doors). Null for all linear pulls (caps, dipsticks, plugs, sliding drawers)."
               hinge_axis:
                 type: ["string", "null"]
                 enum: ["vertical", "horizontal", null]
@@ -190,10 +206,10 @@ response_schema:
                 type: ["string", "null"]
                 description: >
                   A "Point to …" instruction sent verbatim to Molmo2 for move_gripper_to_pose.
-                  Must begin with "Point to" and describe contact geometry in detail —
-                  not the action intent (e.g. "Point to the cylindrical body just below
-                  the rim of the red cup", not "pick up the cup").
-                  Null for primitives other than move_gripper_to_pose.
+                  Must use the template: "Point to the best place to <action verb> the
+                  <object_type> to <complete the goal>." The point must land on the physical
+                  surface of the target object. Never describe scene location — describe the
+                  intended interaction with the object. Null for all other primitives.
               approach_direction:
                 type: ["string", "null"]
                 enum: ["top_down", "side", null]

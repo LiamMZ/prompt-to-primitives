@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -48,7 +49,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--task", required=True, help="Natural language task description")
     p.add_argument("--no-execute", action="store_true", help="Plan but do not send commands to robot")
     p.add_argument("--robot-ip", default="192.168.1.224", help="xArm IP address")
-    p.add_argument("--llm-model", default="gpt-4o", help="OpenAI model for decomposition")
+    p.add_argument("--llm-model", default=os.environ.get("OPENAI_MODEL", "gpt-4o"), help="OpenAI model for decomposition")
     p.add_argument("--api-key", default=None, help="OpenAI API key (or set OPENAI_API_KEY env var)")
     p.add_argument("--perception-pool",
                    default=str(_REPO_ROOT / "outputs" / "perception_pool"),
@@ -65,6 +66,13 @@ def _parse_args() -> argparse.Namespace:
                    help="Use a running molmo_server instead of loading the model locally "
                         "(e.g. http://127.0.0.1:8765). Start the server with: "
                         "python scripts/molmo_server.py")
+    p.add_argument("--sam3d", default=None, metavar="CHECKPOINT_DIR",
+                   help="Enable SAM 3D Objects (local). "
+                        "Pass the checkpoint directory (e.g. checkpoints/hf). "
+                        "Falls back to depth convex hull if SAM3D fails per object.")
+    p.add_argument("--sam3d-server", default=None, metavar="URL",
+                   help="Use a remote SAM3D server instead of loading the model locally "
+                        "(e.g. http://gpu-host:8766). Start with: python scripts/sam3d_server.py")
     return p.parse_args()
 
 
@@ -90,19 +98,32 @@ def build_primitives_interface(robot_ip: str, dry_run: bool, use_gui: bool = Fal
         raise
 
 
-def capture_frame() -> Tuple[Any, Any, Any]:
-    """Capture an RGB-D frame from the wrist-mounted RealSense camera."""
-    import numpy as np
-    from ptp.camera import REALSENSE_AVAILABLE, CameraIntrinsics
+def open_camera() -> Optional[Any]:
+    """Open the RealSense camera and return the instance, or None if unavailable."""
+    from ptp.camera import REALSENSE_AVAILABLE
+    if not REALSENSE_AVAILABLE:
+        return None
+    from ptp.camera.realsense_camera import RealSenseCamera
+    cam = RealSenseCamera(width=640, height=480, fps=30)
+    return cam
 
-    if REALSENSE_AVAILABLE:
-        from ptp.camera.realsense_camera import RealSenseCamera
-        with RealSenseCamera(width=640, height=480, fps=30) as cam:
-            color, depth = cam.get_aligned_frames()
-            intrinsics = cam.get_camera_intrinsics()
+
+def capture_frame(camera: Optional[Any] = None) -> Tuple[Any, Any, Any]:
+    """Capture an RGB-D frame from the wrist-mounted RealSense camera.
+
+    Args:
+        camera: An already-started RealSenseCamera instance. If None, falls back
+                to a synthetic blank frame (dry-run / no hardware).
+    """
+    import numpy as np
+    from ptp.camera import CameraIntrinsics
+
+    if camera is not None:
+        color, depth = camera.get_aligned_frames()
+        intrinsics = camera.get_camera_intrinsics()
         logger.info("Captured RealSense frame: %dx%d", color.shape[1], color.shape[0])
     else:
-        logger.warning("pyrealsense2 not available — using synthetic blank frame")
+        logger.warning("No camera available — using synthetic blank frame")
         color = np.zeros((480, 640, 3), dtype=np.uint8)
         depth = np.zeros((480, 640), dtype=np.float32)
         intrinsics = CameraIntrinsics(fx=600.0, fy=600.0, cx=320.0, cy=240.0, width=640, height=480)
@@ -187,21 +208,33 @@ def build_molmo(server_url: Optional[str] = None) -> Any:
     return detector
 
 
-def detect_objects(color, depth, intrinsics, gsam2_model: str) -> Tuple[Any, Dict[str, Any], Any]:
+def detect_objects(
+    color, depth, intrinsics, gsam2_model: str, llm_client: Any = None, task: Optional[str] = None
+) -> Tuple[Any, Dict[str, Any], Any]:
     """Run GSAM2 segmentation for one frame; return (registry, masks, tracker).
 
     tracker is returned so the caller can extract load/detect timings.
+    task: if provided, noun phrases are extracted and injected into the
+    GroundingDINO prompt so objects mentioned in the task are more likely
+    to be detected even if RAM+ doesn't tag them.
     """
     import asyncio
     from ptp.perception.gsam2.gsam2_tracker import GSAM2ObjectTracker
+    from ptp.perception.gsam2.gsam2_tracker import _extract_noun_phrases
 
     logger.info("Running GSAM2 detection…")
     tracker = GSAM2ObjectTracker(
         grounding_model_id=gsam2_model,
+        llm_client=llm_client,
         compute_clearances=False,
-        compute_contacts=False,
+        compute_contacts=True,
         compute_occlusion=False,
     )
+    if task:
+        hints = _extract_noun_phrases(task)
+        if hints:
+            tracker.set_extra_tags(hints)
+            logger.info("GSAM2 task hints injected: %s", hints)
     asyncio.get_event_loop().run_until_complete(
         tracker.detect_objects(color, depth, intrinsics)
     )
@@ -246,6 +279,81 @@ def save_detections_to_snapshot(
     det_path = snap_dir / "detections.json"
     det_path.write_text(json.dumps(payload, indent=2))
     logger.info("Saved detections.json (%d objects) → %s", len(objects), det_path)
+
+
+def run_perception(
+    perception_pool: Path,
+    gsam2_model: str,
+    primitives: Any,
+    timer: Any,
+    camera: Optional[Any] = None,
+    llm_client: Any = None,
+    snapshot_id: Optional[str] = None,
+    run_dir: Optional[Path] = None,
+    sam3d: Optional[Any] = None,
+    task: Optional[str] = None,
+) -> Tuple[Any, Any, Any, Any, Any, str, Optional[Dict[str, Any]]]:
+    """Capture a fresh frame, run GSAM2, rebuild collision meshes.
+
+    Returns (color, depth, intrinsics, registry, masks, snapshot_id, robot_state).
+    """
+    if snapshot_id is None:
+        snapshot_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+    # Capture robot state first so the transform is paired with this frame.
+    robot_state: Optional[Dict[str, Any]] = None
+    if primitives is not None:
+        try:
+            robot_state = primitives.get_robot_state()
+            logger.info(
+                "Robot state captured: joints=%s camera_pos=%s",
+                robot_state.get("joints"),
+                (robot_state.get("camera") or {}).get("position"),
+            )
+        except Exception as exc:
+            logger.warning("Could not capture robot state: %s", exc)
+
+    with timer.measure("frame_capture"):
+        color, depth, intrinsics = capture_frame(camera)
+
+    save_snapshot(color, depth, intrinsics, perception_pool, snapshot_id, robot_state=robot_state)
+
+    with timer.measure("perception.total"):
+        registry, masks, gsam2_tracker = detect_objects(color, depth, intrinsics, gsam2_model, llm_client=llm_client, task=task)
+
+    gsam2_load_s = getattr(getattr(gsam2_tracker, "_gsam2", None), "load_time_s",
+                           getattr(gsam2_tracker, "load_time_s", 0.0))
+    timer.record("model_load.gsam2", gsam2_load_s)
+    if hasattr(gsam2_tracker, "last_detect_timings"):
+        for k, v in gsam2_tracker.last_detect_timings.items():
+            timer.record(f"perception.{k}", v)
+
+    save_detections_to_snapshot(registry, perception_pool, snapshot_id)
+
+    with timer.measure("perception.collision_mesh_build"):
+        if primitives is not None and masks:
+            try:
+                from ptp.kinematics.depth_environment_collider import DepthEnvironmentCollider
+                collider = DepthEnvironmentCollider(primitives._planner, sam3d=sam3d)
+                snap_joints = (robot_state or {}).get("joints")
+                if snap_joints is not None:
+                    primitives._planner.set_current_joint_state(snap_joints)
+                effective_run_dir = run_dir or (perception_pool / "snapshots" / snapshot_id)
+                effective_run_dir.mkdir(parents=True, exist_ok=True)
+                result = collider.update_from_depth(
+                    depth_m=depth.astype("float32"),
+                    intrinsics=intrinsics,
+                    masks=masks,
+                    debug_dir=str(effective_run_dir),
+                    color_image=color,
+                )
+                logger.info("Collision meshes built: %s", result)
+                primitives._depth_collider = collider
+                primitives._planner.attach_collider(collider)
+            except Exception as exc:
+                logger.warning("Could not build collision meshes: %s", exc)
+
+    return color, depth, intrinsics, registry, masks, snapshot_id, robot_state
 
 
 def build_world_state(registry, snapshot_id: str) -> Dict[str, Any]:
@@ -296,16 +404,13 @@ def parse_task(
     task: str,
     registry: Any,
     labeled_image_bytes: Optional[bytes],
-    llm_model: str,
-    api_key: Optional[str],
+    llm_client: Any,
     temperature: float,
 ) -> Any:
     """Translate a natural language task into grounded (action, object_id) pairs."""
     from ptp.primitives.task_parser import TaskParser
-    from ptp.llm_interface.openai_client import OpenAIClient
 
-    llm = OpenAIClient(model=llm_model, api_key=api_key or None)
-    parser = TaskParser(llm_client=llm)
+    parser = TaskParser(llm_client=llm_client)
     logger.info("Parsing task: %r", task)
     result = parser.parse(task=task, registry=registry, image_bytes=labeled_image_bytes, temperature=temperature)
     logger.info("Task parser rationale: %s", result.rationale)
@@ -317,20 +422,24 @@ def parse_task(
 def decompose_task(
     parsed_action: Any,
     world_state: Dict[str, Any],
-    llm_model: str,
-    api_key: Optional[str],
+    llm_client: Any,
     temperature: float,
     perception_pool: Optional[Path] = None,
     labeled_image_bytes: Optional[bytes] = None,
 ) -> Any:
     """Run the LLM decomposer on a single ParsedAction to produce a SkillPlan."""
     from ptp.primitives.decomposer import SkillDecomposer
-    from ptp.llm_interface.openai_client import OpenAIClient
 
-    llm = OpenAIClient(model=llm_model, api_key=api_key or None)
-    decomposer = SkillDecomposer(llm_client=llm, perception_pool_dir=perception_pool)
-    parameters = {"object_id": parsed_action.object_id} if parsed_action.object_id else {}
-    logger.info("Decomposing action: %r → object=%s", parsed_action.action, parsed_action.object_id)
+    decomposer = SkillDecomposer(llm_client=llm_client, perception_pool_dir=perception_pool)
+    parameters: Dict[str, Any] = {}
+    if parsed_action.object_id:
+        parameters["object_id"] = parsed_action.object_id
+    if parsed_action.secondary_object_id:
+        parameters["secondary_object_id"] = parsed_action.secondary_object_id
+    logger.info(
+        "Decomposing action: %r → object=%s secondary=%s",
+        parsed_action.action, parsed_action.object_id, parsed_action.secondary_object_id,
+    )
     plan = decomposer.plan(
         action_name=parsed_action.description,
         parameters=parameters,
@@ -625,149 +734,184 @@ def main() -> None:
     perception_pool = Path(args.perception_pool)
     perception_pool.mkdir(parents=True, exist_ok=True)
 
-    snapshot_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = _REPO_ROOT / "outputs" / "run_ptp" / snapshot_id
+    run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = _REPO_ROOT / "outputs" / "run_ptp" / run_ts
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     timer = RunTimer()
 
-    # 1. Robot interface
+    # ── 1. Robot interface ────────────────────────────────────────────────────
     with timer.measure("robot_init"):
         primitives = build_primitives_interface(args.robot_ip, dry_run=args.no_execute,
                                                 use_gui=args.pybullet_gui)
 
-    # 2. Capture robot state (joints + camera transform) at the moment of capture.
-    robot_state: Optional[Dict[str, Any]] = None
-    if primitives is not None:
-        try:
-            robot_state = primitives.get_robot_state()
-            logger.info(
-                "Robot state captured: joints=%s camera_pos=%s",
-                robot_state.get("joints"),
-                (robot_state.get("camera") or {}).get("position"),
-            )
-        except Exception as exc:
-            logger.warning("Could not capture robot state: %s", exc)
+    # ── 2. Build shared LLM client — used by tagger, task parser, and decomposer
+    from ptp.llm_interface.openai_client import OpenAIClient
+    llm_client = OpenAIClient(model=args.llm_model, api_key=args.api_key or None)
 
-    # 3. Capture frame
-    with timer.measure("frame_capture"):
-        color, depth, intrinsics = capture_frame()
-
-    # 4. Save snapshot
-    save_snapshot(color, depth, intrinsics, perception_pool, snapshot_id,
-                  robot_state=robot_state)
-
-    # 5. Load Molmo (or connect to server)
+    # ── 2. Load Molmo once — shared across all actions ────────────────────────
     with timer.measure("model_load.molmo"):
         molmo = build_molmo(server_url=args.molmo_server)
     if molmo is not None:
         timer.record("model_load.molmo_detail", getattr(molmo, "load_time_s", 0.0))
 
-    # 6. Detect objects (GSAM2 model load happens inside; load_time_s pulled out after)
-    with timer.measure("perception.total"):
-        registry, masks, gsam2_tracker = detect_objects(color, depth, intrinsics, args.gsam2_model)
-    # Pull sub-timings from tracker
-    gsam2_load_s = getattr(getattr(gsam2_tracker, "_gsam2", None), "load_time_s",
-                           getattr(gsam2_tracker, "load_time_s", 0.0))
-    timer.record("model_load.gsam2", gsam2_load_s)
-    if hasattr(gsam2_tracker, "last_detect_timings"):
-        for k, v in gsam2_tracker.last_detect_timings.items():
-            timer.record(f"perception.{k}", v)
+    # ── 2b. Open RealSense camera once — kept alive across all perception calls ─
+    camera = open_camera() if not args.no_execute else None
 
-    # 6a. Save detections.json so decomposer can annotate the scene image
-    save_detections_to_snapshot(registry, perception_pool, snapshot_id)
+    # ── 2c. Load SAM3D once if requested (local or remote) ───────────────────
+    sam3d = None
+    if args.sam3d_server:
+        from ptp.perception.sam3d_meshifier import Sam3DMeshifier
+        sam3d = Sam3DMeshifier(server_url=args.sam3d_server)
+        sam3d.load()  # health-checks the server
+        logger.info("Using SAM3D server at %s", args.sam3d_server)
+    elif args.sam3d:
+        with timer.measure("model_load.sam3d"):
+            from ptp.perception.sam3d_meshifier import Sam3DMeshifier
+            sam3d = Sam3DMeshifier(checkpoint_dir=args.sam3d)
+            sam3d.load()
+        logger.info("SAM 3D Objects loaded from %s", args.sam3d)
 
-    # 6b. Build collision meshes from the already-captured depth frame
-    with timer.measure("perception.collision_mesh_build"):
-        if primitives is not None and masks:
-            try:
-                from ptp.kinematics.depth_environment_collider import DepthEnvironmentCollider
-                collider = DepthEnvironmentCollider(primitives._planner)
-                snap_joints = (robot_state or {}).get("joints")
-                if snap_joints is not None:
-                    primitives._planner.set_current_joint_state(snap_joints)
-                run_dir.mkdir(parents=True, exist_ok=True)
-                result = collider.update_from_depth(
-                    depth_m=depth.astype("float32"),
-                    intrinsics=intrinsics,
-                    masks=masks,
-                    debug_dir=str(run_dir),
-                )
-                logger.info("Collision meshes built: %s", result)
-                primitives._depth_collider = collider
-                primitives._planner.attach_collider(collider)
-            except Exception as exc:
-                logger.warning("Could not build collision meshes: %s", exc)
-
-    # 7. Build world state
-    world_state = build_world_state(registry, snapshot_id)
+    # ── 3. Initial perception — used only for task parsing ───────────────────
+    logger.info("Running initial perception for task parsing…")
+    color, depth, intrinsics, registry, masks, snapshot_id, robot_state = run_perception(
+        perception_pool=perception_pool,
+        gsam2_model=args.gsam2_model,
+        primitives=primitives,
+        timer=timer,
+        camera=camera,
+        llm_client=llm_client,
+        snapshot_id=run_ts,
+        run_dir=run_dir,
+        sam3d=sam3d,
+        task=args.task,
+    )
 
     input("\nPerception complete — press Enter to continue to task parsing…\n")
 
-    # 8. Build labeled scene image once — shared by task parser and decomposer.
+    # ── 4. Build labeled image + parse task ───────────────────────────────────
     labeled_image_bytes = build_scene_labeled_image(color, registry)
     if labeled_image_bytes is not None:
-        run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "planner_input.png").write_bytes(labeled_image_bytes)
 
-    # 9. Parse task → grounded (action, object_id) sequence
     with timer.measure("task_parsing"):
         parse_result = parse_task(
             task=args.task,
             registry=registry,
             labeled_image_bytes=labeled_image_bytes,
-            llm_model=args.llm_model,
-            api_key=args.api_key,
+            llm_client=llm_client,
             temperature=args.temperature,
         )
-    (run_dir / "task_parse.json").parent.mkdir(parents=True, exist_ok=True)
-    run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "task_parse.json").write_text(
         json.dumps({
             "task": args.task,
             "rationale": parse_result.rationale,
             "actions": [
-                {"action": a.action, "object_id": a.object_id, "description": a.description}
+                {
+                    "action": a.action,
+                    "object_id": a.object_id,
+                    "secondary_object_id": a.secondary_object_id,
+                    "description": a.description,
+                }
                 for a in parse_result.actions
             ],
         }, indent=2)
     )
 
-    # 9. Decompose each parsed action into primitives
+    # ── 5. Per-action loop: fresh perception → decompose → execute ────────────
     from ptp.primitives.types import SkillPlan
-    plans: List[Any] = []
-    with timer.measure("decomposition"):
-        for i, parsed_action in enumerate(parse_result.actions):
-            with timer.measure(f"decomposition.action[{i}]"):
-                sub_plan = decompose_task(
-                    parsed_action=parsed_action,
-                    world_state=world_state,
-                    llm_model=args.llm_model,
-                    api_key=args.api_key,
-                    temperature=args.temperature,
-                    perception_pool=perception_pool,
-                    labeled_image_bytes=labeled_image_bytes,
-                )
-            plans.append(sub_plan)
+    all_plans: List[Any] = []
+    all_execution_results: List[Any] = []
 
-    # Merge all sub-plans into a single plan for execution and output.
-    plan = plans[0] if plans else SkillPlan(action_name=args.task)
-    for sub in plans[1:]:
+    for i, parsed_action in enumerate(parse_result.actions):
+        action_label = f"action[{i}] {parsed_action.action}({parsed_action.object_id})"
+        logger.info("━━━ %s (%d/%d) ━━━", action_label, i + 1, len(parse_result.actions))
+
+        # Fresh perception before each action.
+        logger.info("[%s] Running fresh perception…", action_label)
+        action_snap_id = f"{run_ts}_action{i}"
+        action_run_dir = run_dir / f"action_{i}"
+        action_run_dir.mkdir(parents=True, exist_ok=True)
+
+        (
+            color, depth, intrinsics, registry, masks,
+            action_snap_id, robot_state,
+        ) = run_perception(
+            perception_pool=perception_pool,
+            gsam2_model=args.gsam2_model,
+            primitives=primitives,
+            timer=timer,
+            camera=camera,
+            llm_client=llm_client,
+            snapshot_id=action_snap_id,
+            run_dir=action_run_dir,
+            sam3d=sam3d,
+            task=args.task,
+        )
+
+        world_state = build_world_state(registry, action_snap_id)
+        action_labeled_image = build_scene_labeled_image(color, registry)
+        if action_labeled_image is not None:
+            (action_run_dir / "planner_input.png").write_bytes(action_labeled_image)
+
+        # Decompose this action with the fresh world state.
+        with timer.measure(f"decomposition.{action_label}"):
+            sub_plan = decompose_task(
+                parsed_action=parsed_action,
+                world_state=world_state,
+                llm_client=llm_client,
+                temperature=args.temperature,
+                perception_pool=perception_pool,
+                labeled_image_bytes=action_labeled_image,
+            )
+        all_plans.append(sub_plan)
+        if sub_plan.raw_llm_response is not None:
+            try:
+                parsed_resp = json.loads(sub_plan.raw_llm_response)
+                (action_run_dir / "llm_response.json").write_text(json.dumps(parsed_resp, indent=2))
+            except Exception:
+                (action_run_dir / "llm_response.json").write_text(sub_plan.raw_llm_response)
+
+        # Execute immediately with the same fresh perception data.
+        # Molmo grounding is deferred inside execute_plan (prepare_plan) — it runs
+        # against the snapshot saved by this iteration's run_perception().
+        with timer.measure(f"execution.{action_label}"):
+            exec_result = execute_plan(
+                sub_plan, primitives, molmo, world_state, perception_pool,
+                dry_run=args.no_execute, masks=masks,
+            )
+        all_execution_results.append(exec_result)
+        for k, v in (exec_result.timings or {}).items():
+            timer.record(f"execution.{action_label}.{k}", v)
+
+        # Save per-action outputs.
+        save_run_outputs(
+            run_dir=action_run_dir,
+            color=color,
+            task=f"{args.task} [{action_label}]",
+            snapshot_id=action_snap_id,
+            registry=registry,
+            plan=sub_plan,
+            execution_result=exec_result,
+            timings=timer.to_dict(),
+        )
+
+        if not exec_result.executed and not args.no_execute:
+            logger.error("[%s] Execution failed — aborting remaining actions.", action_label)
+            break
+
+    timer.log_summary(logger)
+
+    # ── 6. Top-level summary ──────────────────────────────────────────────────
+    # Merge all sub-plans for the top-level summary outputs.
+    plan = all_plans[0] if all_plans else SkillPlan(action_name=args.task)
+    for sub in all_plans[1:]:
         plan.primitives.extend(sub.primitives)
         plan.diagnostics.warnings.extend(sub.diagnostics.warnings)
         plan.diagnostics.assumptions.extend(sub.diagnostics.assumptions)
         plan.diagnostics.freshness_notes.extend(sub.diagnostics.freshness_notes)
 
-    # 10. Execute
-    with timer.measure("execution.total"):
-        execution_result = execute_plan(plan, primitives, molmo, world_state, perception_pool,
-                                        dry_run=args.no_execute, masks=masks)
-    # Merge per-primitive timings from executor
-    for k, v in (execution_result.timings or {}).items():
-        timer.record(f"execution.{k}", v)
-
-    timer.log_summary(logger)
-
-    # 11. Save run outputs
+    last_exec = all_execution_results[-1] if all_execution_results else None
     save_run_outputs(
         run_dir=run_dir,
         color=color,
@@ -775,7 +919,7 @@ def main() -> None:
         snapshot_id=snapshot_id,
         registry=registry,
         plan=plan,
-        execution_result=execution_result,
+        execution_result=last_exec,
         timings=timer.to_dict(),
     )
 

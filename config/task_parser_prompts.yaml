@@ -9,17 +9,25 @@ template: |
   Detected objects (object_id, object_type, position_2d [y,x] in 0-1000 scale):
   {object_list}
 
+  Spatial relationships (derived from depth — obj_a supports obj_b means obj_b
+  is resting on top of obj_a):
+  {spatial_relations}
+
   Task: "{task}"
 
   Rules:
   1. Produce one action per logical step. Multi-step tasks (e.g. "pick up X and
      place it on Y") should expand to separate actions.
-  2. Each action must be paired with at least one object_id from the detected list
-     above. Choose the object_id of the most semantically meaningful object for
-     the action — the thing whose state changes as a result of the action, not a
-     sub-component used to achieve it. The downstream planner resolves how to
-     physically interact with it (which parts to grasp, push, etc.). If no
-     detected object matches, set object_id to null and explain in description.
+
+  2. Each action must be paired with at least one object_id from the detected list.
+     Choose the object_id of the most semantically meaningful object for the action
+     — the thing whose state changes as a result of the action. If no detected
+     object matches, set object_id to null and explain in description.
+     For actions that involve two objects (place X on Y, pour X into Y, hand X
+     to Y), set object_id to the object being moved/acted on and
+     secondary_object_id to the destination or recipient object. Leave
+     secondary_object_id null for single-object actions.
+
   3. action is a free-form verb or verb phrase describing the manipulation intent.
      Choose whatever wording best captures the goal — the downstream planner will
      decompose it into motion primitives. Examples of valid actions:
@@ -27,11 +35,38 @@ template: |
        switch_on, switch_off, pour, slide, knock_over, displace, hand_over
      Any action is acceptable as long as it can in principle be decomposed into
      contact-based robot motions on the target object.
+
   4. description should be a concise restatement of what this specific step
      accomplishes, including any relevant detail from the user's phrasing
      (e.g. colour, location qualifier, goal state). This description — not the
      action field — is what gets passed verbatim to the primitive decomposer, so
      make it self-contained and specific.
+
+  4b. rationale should trace the gripper state through the full action sequence,
+      reasoning explicitly about preconditions and effects at each step. For each
+      action, note: (a) whether the gripper is empty or holding an object before
+      the action, (b) what changes in the scene as a result (object moved, door
+      opened, gripper now holding X, etc.), and (c) why the ordering is correct.
+      Example format: "Step 1 [pick_up object_A]: gripper empty → grasp
+      object_A → gripper now holding object_A. Step 2 [place object_A on
+      object_B]: gripper holding object_A → place on object_B → gripper
+      empty, object_A on object_B."
+
+  5. {robot_constraints}
+
+  6. Physical preconditions — use the RGB image and spatial relationships to
+     identify blocking objects. If the target object cannot be safely accessed
+     without first moving another object (e.g. something is resting on top of it,
+     or directly obstructing the approach), prepend the necessary prerequisite
+     action(s) before the user's intended action. Each prerequisite is a separate
+     action entry with its own object_id. If the user's instruction acknowledges
+     the risk (e.g. "without breaking X") and X is on the target, this confirms
+     the precondition — add a move/place action for X first.
+     ⚠ Every pick_up of a blocking object MUST be followed immediately by a
+     place action before the gripper can grasp the next object. A pick_up with
+     no corresponding place leaves the gripper occupied and makes the subsequent
+     action impossible. Never generate a pick_up prerequisite without also
+     generating the place that deposits it somewhere safe.
 
 response_schema:
   type: object
@@ -43,18 +78,28 @@ response_schema:
       description: Ordered high-level actions parsed from the task.
       items:
         type: object
-        required: ["action", "object_id", "description"]
+        required: ["action", "object_id", "secondary_object_id", "description"]
         additionalProperties: false
         properties:
           action:
             type: string
-            description: Free-form verb or verb phrase describing the manipulation intent (e.g. "open", "switch_on", "pick_up").
+            description: Free-form verb or verb phrase describing the manipulation intent (e.g. "open", "pick_up", "place").
           object_id:
             type: ["string", "null"]
-            description: Detected object_id this action targets. Null if unresolvable.
+            description: The primary object being acted on. Null if unresolvable.
+          secondary_object_id:
+            type: ["string", "null"]
+            description: >
+              Destination or recipient object for two-object actions (place, pour,
+              hand_over, etc.). E.g. for "place cup on tray": object_id=cup,
+              secondary_object_id=tray. Null for single-object actions.
           description:
             type: string
-            description: One-sentence restatement of this step's intent.
+            description: One-sentence restatement of this step's intent, self-contained enough for the downstream planner.
     rationale:
       type: string
-      description: Brief explanation of how the task was interpreted and how objects were matched.
+      description: >
+        Step-by-step reasoning tracing gripper state through the action sequence.
+        For each step, state the gripper precondition (empty or holding X), the
+        effect on the scene (what changes), and why the ordering is correct.
+        Also note how the task was interpreted and how objects were matched.

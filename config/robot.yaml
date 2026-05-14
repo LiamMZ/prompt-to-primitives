@@ -1,0 +1,19 @@
+# Robot capability description.
+# Loaded by the task parser and skill decomposer to constrain LLM planning.
+
+name: xArm 7
+arms: 1
+grippers_per_arm: 1
+
+capabilities:
+  # Maximum number of objects the robot can hold simultaneously across all grippers.
+  max_held_objects: 1
+
+  # Whether the robot can perform bimanual manipulation.
+  bimanual: false
+
+  # Whether the robot has a mobile base (can reposition itself).
+  mobile_base: false
+
+  # Maximum reach from base frame origin in metres (approximate).
+  max_reach_m: 0.70

@@ -361,7 +361,7 @@ class SkillDecomposer:
 
     def _extract_object_ids(self, parameters: Dict[str, Any]) -> List[str]:
         ids: List[str] = []
-        for key in ("object_id", "objects", "object_ids"):
+        for key in ("object_id", "secondary_object_id", "objects", "object_ids"):
             val = parameters.get(key)
             if isinstance(val, str):
                 ids.append(val)

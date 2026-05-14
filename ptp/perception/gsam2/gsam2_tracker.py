@@ -175,11 +175,9 @@ class GSAM2ObjectTracker:
 
     def __init__(
         self,
-        grounding_model_id: str = "IDEA-Research/grounding-dino-tiny",
+        grounding_model_id: str = os.environ.get("DINO_CKPT", "IDEA-Research/grounding-dino-tiny"),
         sam2_model_cfg: str = _SAM2_CFG,
         sam2_ckpt_path: str = _SAM2_CKPT,
-        openai_api_key: Optional[str] = None,
-        tagger_model: str = "gpt-4o-mini",
         detection_interval: int = 20,
         score_threshold: float = 0.5,
         overlap_iou_threshold: float = 0.5,
@@ -245,7 +243,7 @@ class GSAM2ObjectTracker:
         )
         self.logger.info("GroundingDINO + SAM2 loaded.")
 
-        self._tagger = OpenAITagger(api_key=openai_api_key, model=tagger_model)
+        self._tagger = OpenAITagger(llm_client=llm_client) if llm_client is not None else None
         self._current_prompt: str = "object."
         self._frame_count: int = 0
         self._extra_tags: List[str] = []
@@ -393,7 +391,8 @@ class GSAM2ObjectTracker:
             if depth_frame is not None and camera_intrinsics is not None:
                 cam_pos = compute_3d_position(position_2d, depth_frame, camera_intrinsics)
                 if cam_pos is not None:
-                    position_3d = _transform_cam_to_world(cam_pos, robot_state) or cam_pos
+                    world_pos = _transform_cam_to_world(cam_pos, robot_state)
+                    position_3d = world_pos if world_pos is not None else cam_pos
             _t_localize_s += time.perf_counter() - _t0
 
             affordances: Set[str]
@@ -629,11 +628,9 @@ class GSAM2ContinuousObjectTracker:
 
     def __init__(
         self,
-        grounding_model_id: str = "IDEA-Research/grounding-dino-tiny",
+        grounding_model_id: str = "IDEA-Research/grounding-dino-base",
         sam2_model_cfg: str = _SAM2_CFG,
         sam2_ckpt_path: str = _SAM2_CKPT,
-        openai_api_key: Optional[str] = None,
-        tagger_model: str = "gpt-4o-mini",
         detection_interval: int = 20,
         score_threshold: float = 0.5,
         overlap_iou_threshold: float = 0.5,
@@ -659,8 +656,6 @@ class GSAM2ContinuousObjectTracker:
             grounding_model_id=grounding_model_id,
             sam2_model_cfg=sam2_model_cfg,
             sam2_ckpt_path=sam2_ckpt_path,
-            openai_api_key=openai_api_key,
-            tagger_model=tagger_model,
             detection_interval=detection_interval,
             score_threshold=score_threshold,
             overlap_iou_threshold=overlap_iou_threshold,

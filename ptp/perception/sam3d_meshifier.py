@@ -1,0 +1,297 @@
+"""SAM3D mesh reconstruction for per-object collision bodies.
+
+Wraps the SAM 3D Objects inference API to produce Open3D TriangleMesh objects
+from a single RGB image + 2D segmentation mask.
+
+Two modes:
+  - Local:  Sam3DMeshifier(checkpoint_dir="checkpoints/hf")
+  - Remote: Sam3DMeshifier(server_url="http://host:8766")
+
+Usage::
+
+    # local
+    meshifier = Sam3DMeshifier(checkpoint_dir="checkpoints/hf")
+    mesh = meshifier.reconstruct(color_rgb, mask_bool, T_base_cam)
+
+    # remote (server running scripts/sam3d_server.py)
+    meshifier = Sam3DMeshifier(server_url="http://gpu-host:8766")
+    mesh = meshifier.reconstruct(color_rgb, mask_bool, T_base_cam)
+
+    # batch
+    meshes = meshifier.reconstruct_all(color_rgb, masks_dict, T_base_cam)
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import logging
+import tempfile
+from pathlib import Path
+from typing import Dict, Optional
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+class Sam3DMeshifier:
+    """Reconstruct per-object 3D meshes using SAM 3D Objects.
+
+    Pass either ``checkpoint_dir`` (local inference) or ``server_url`` (remote
+    server started with ``scripts/sam3d_server.py``).  If both are given,
+    ``server_url`` takes precedence.
+
+    Args:
+        checkpoint_dir: Path to the SAM3D checkpoint directory containing
+            ``pipeline.yaml`` (local mode only).
+        server_url: Base URL of a running sam3d_server, e.g.
+            ``"http://127.0.0.1:8766"`` or a HuggingFace Space URL.
+        compile: torch.compile the model for faster inference (local mode,
+            slower first call).
+    """
+
+    def __init__(
+        self,
+        checkpoint_dir: str = "checkpoints/hf",
+        server_url: Optional[str] = None,
+        compile: bool = False,
+    ) -> None:
+        self._server_url = server_url.rstrip("/") if server_url else None
+        self._checkpoint_dir = Path(checkpoint_dir)
+        self._compile = compile
+        self._inference = None  # local model, lazy-loaded
+
+    @property
+    def is_remote(self) -> bool:
+        return self._server_url is not None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def load(self) -> None:
+        """Load the model (local mode) or health-check the server (remote mode)."""
+        if self.is_remote:
+            self._check_health()
+            return
+        if self._inference is not None:
+            return
+        pipeline_yaml = self._checkpoint_dir / "pipeline.yaml"
+        if not pipeline_yaml.exists():
+            raise FileNotFoundError(
+                f"SAM3D pipeline.yaml not found at {pipeline_yaml}. "
+                "Download checkpoints with: hf download facebook/sam-3d-objects"
+            )
+        try:
+            from inference import Inference  # sam3d-objects package
+        except ImportError as exc:
+            raise ImportError(
+                "sam3d-objects package not installed. "
+                "Follow setup instructions in environments/default.yml."
+            ) from exc
+        logger.info("Loading SAM 3D Objects model from %s …", pipeline_yaml)
+        self._inference = Inference(str(pipeline_yaml), compile=self._compile)
+        logger.info("SAM 3D Objects model loaded.")
+
+    def reconstruct(
+        self,
+        color_rgb: np.ndarray,
+        mask: np.ndarray,
+        T_base_cam: np.ndarray,
+        seed: int = 42,
+    ) -> Optional[object]:
+        """Reconstruct a single object mesh in the robot base frame.
+
+        Args:
+            color_rgb: (H, W, 3) uint8 RGB image.
+            mask: (H, W) bool mask selecting the object pixels.
+            T_base_cam: (4, 4) homogeneous camera-to-base transform.
+            seed: Random seed for reproducibility.
+
+        Returns:
+            open3d.geometry.TriangleMesh in base frame, or None on failure.
+        """
+        try:
+            return self._reconstruct_one(color_rgb, mask, T_base_cam, seed)
+        except Exception as exc:
+            logger.warning("SAM3D reconstruction failed: %s", exc)
+            return None
+
+    def reconstruct_all(
+        self,
+        color_rgb: np.ndarray,
+        masks: Dict[str, np.ndarray],
+        T_base_cam: np.ndarray,
+        seed: int = 42,
+    ) -> Dict[str, Optional[object]]:
+        """Reconstruct meshes for all objects in ``masks``.
+
+        Returns a dict mapping object_id → mesh (or None on per-object failure).
+        """
+        results: Dict[str, Optional[object]] = {}
+        for obj_id, mask in masks.items():
+            try:
+                results[obj_id] = self._reconstruct_one(color_rgb, mask, T_base_cam, seed)
+            except Exception as exc:
+                logger.warning("SAM3D reconstruction failed for %r: %s", obj_id, exc)
+                results[obj_id] = None
+        return results
+
+    # ------------------------------------------------------------------
+    # Internals — dispatch
+    # ------------------------------------------------------------------
+
+    def _reconstruct_one(
+        self,
+        color_rgb: np.ndarray,
+        mask: np.ndarray,
+        T_base_cam: np.ndarray,
+        seed: int,
+    ) -> Optional[object]:
+        if self.is_remote:
+            mesh = self._reconstruct_remote(color_rgb, mask, seed)
+        else:
+            self.load()
+            mesh = self._reconstruct_local(color_rgb, mask, seed)
+
+        if mesh is None or len(mesh.triangles) == 0:
+            return None
+
+        # Place mesh at the depth-derived centroid of the mask, then transform
+        # into the robot base frame.
+        cam_translation = self._mask_centroid_cam(color_rgb, mask)
+        if cam_translation is None:
+            return None
+        mesh.translate(cam_translation)
+        mesh.transform(T_base_cam)
+        return mesh
+
+    # ------------------------------------------------------------------
+    # Local inference
+    # ------------------------------------------------------------------
+
+    def _reconstruct_local(
+        self,
+        color_rgb: np.ndarray,
+        mask: np.ndarray,
+        seed: int,
+    ) -> Optional[object]:
+        from PIL import Image as _PIL
+
+        alpha = (mask.astype(np.uint8) * 255)
+        rgba = np.dstack([color_rgb, alpha])
+        pil_image = _PIL.fromarray(rgba, mode="RGBA")
+
+        output = self._inference(pil_image, seed=seed)
+        return self._output_to_open3d(output)
+
+    def _output_to_open3d(self, output: dict) -> Optional[object]:
+        import open3d as o3d
+
+        gs = output.get("gs")
+        if gs is None:
+            return None
+
+        if isinstance(gs, (str, Path)):
+            pcd = o3d.io.read_point_cloud(str(gs))
+        else:
+            try:
+                pts = np.asarray(gs.get_xyz().cpu())
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(pts)
+            except Exception:
+                return None
+
+        if len(pcd.points) < 4:
+            return None
+
+        hull, _ = pcd.compute_convex_hull()
+        hull.orient_triangles()
+        return hull
+
+    # ------------------------------------------------------------------
+    # Remote inference
+    # ------------------------------------------------------------------
+
+    def _check_health(self) -> None:
+        import urllib.request
+        url = f"{self._server_url}/health"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"HTTP {r.status}")
+        except Exception as exc:
+            raise RuntimeError(
+                f"SAM3D server not reachable at {self._server_url}: {exc}. "
+                "Start it with: python scripts/sam3d_server.py"
+            ) from exc
+        logger.info("SAM3D server reachable at %s", self._server_url)
+
+    def _reconstruct_remote(
+        self,
+        color_rgb: np.ndarray,
+        mask: np.ndarray,
+        seed: int,
+    ) -> Optional[object]:
+        import urllib.request
+        import json
+        import open3d as o3d
+        from PIL import Image as _PIL
+
+        # Encode RGB image as PNG base64.
+        buf = io.BytesIO()
+        _PIL.fromarray(color_rgb.astype(np.uint8)).save(buf, format="PNG")
+        image_b64 = base64.b64encode(buf.getvalue()).decode()
+
+        # Encode mask as single-channel PNG base64.
+        mask_buf = io.BytesIO()
+        _PIL.fromarray((mask.astype(np.uint8) * 255)).save(mask_buf, format="PNG")
+        mask_b64 = base64.b64encode(mask_buf.getvalue()).decode()
+
+        payload = json.dumps({
+            "image_b64": image_b64,
+            "mask_b64": mask_b64,
+            "seed": seed,
+        }).encode()
+
+        req = urllib.request.Request(
+            f"{self._server_url}/reconstruct",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                body = json.loads(r.read())
+        except Exception as exc:
+            raise RuntimeError(f"SAM3D server request failed: {exc}") from exc
+
+        if "error" in body:
+            raise RuntimeError(f"SAM3D server error: {body['error']}")
+
+        ply_bytes = base64.b64decode(body["mesh_ply_b64"])
+        with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as f:
+            f.write(ply_bytes)
+            tmp_path = f.name
+        mesh = o3d.io.read_triangle_mesh(tmp_path)
+        Path(tmp_path).unlink(missing_ok=True)
+
+        logger.debug("SAM3D remote: received mesh with %d triangles", len(mesh.triangles))
+        return mesh if len(mesh.triangles) > 0 else None
+
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+
+    def _mask_centroid_cam(
+        self,
+        color_rgb: np.ndarray,
+        mask: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        ys, xs = np.where(mask.astype(bool))
+        if len(ys) == 0:
+            return None
+        cy, cx = float(ys.mean()), float(xs.mean())
+        h, w = mask.shape[:2]
+        return np.array([cx / w - 0.5, cy / h - 0.5, 0.0])

@@ -331,6 +331,14 @@ class XArmPybulletPlannedPrimitives:
         pos = np.asarray(target_position, dtype=float).tolist()
         if is_place:
             pos[2] += 0.04
+        # Clamp z to floor — depth noise can push the back-projected point slightly
+        # below zero, causing every IK seed to land in collision with the table mesh.
+        _MIN_GRASP_Z = 0.005
+        if pos[2] < _MIN_GRASP_Z:
+            self._logger.debug(
+                "target z=%.4f clamped to %.4f (floor guard)", pos[2], _MIN_GRASP_Z
+            )
+            pos[2] = _MIN_GRASP_Z
 
         use_side = (preset_orientation == "side") or is_side_grasp
         seed_name = "side" if use_side else "top_down"

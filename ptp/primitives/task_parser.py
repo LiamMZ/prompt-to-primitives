@@ -32,6 +32,7 @@ import yaml
 from ptp.llm_interface.base import GenerateConfig, ImagePart, LLMClient
 
 _DEFAULT_PROMPTS_PATH = Path(__file__).resolve().parents[2] / "config" / "task_parser_prompts.yaml"
+_DEFAULT_ROBOT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "robot.yaml"
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ class ParsedAction:
     action: str
     object_id: Optional[str]
     description: str
+    secondary_object_id: Optional[str] = None  # destination/recipient for place, pour, hand_over etc.
 
 
 @dataclass
@@ -64,10 +66,13 @@ class TaskParser:
         self,
         llm_client: LLMClient,
         prompts_config_path: Optional[Path] = None,
+        robot_config_path: Optional[Path] = None,
     ) -> None:
         self._llm_client = llm_client
         self.prompts_config_path = Path(prompts_config_path or _DEFAULT_PROMPTS_PATH)
+        self._robot_config_path = Path(robot_config_path or _DEFAULT_ROBOT_CONFIG_PATH)
         self._prompts_cache: Tuple[float, Optional[Dict[str, Any]]] = (0.0, None)
+        self._robot_config: Optional[Dict[str, Any]] = None
 
     def parse(
         self,
@@ -89,7 +94,8 @@ class TaskParser:
         """
         objects = self._extract_objects(registry)
         prompts = self._load_prompts()
-        prompt = self._build_prompt(task, objects, prompts["template"])
+        robot_cfg = self._load_robot_config()
+        prompt = self._build_prompt(task, objects, prompts["template"], registry=registry, robot_config=robot_cfg)
         media: List[Any] = [ImagePart(data=image_bytes, mime_type="image/png")] if image_bytes else []
 
         config = GenerateConfig(
@@ -99,6 +105,7 @@ class TaskParser:
             response_mime_type="application/json",
             response_json_schema=prompts["response_schema"],
         )
+        logger.info("[TaskParser] Prompt:\n%s", prompt)
         contents = media + [prompt] if media else prompt
         response = self._llm_client.generate(contents, config=config)
         raw = response.text
@@ -118,11 +125,22 @@ class TaskParser:
             return registry.get("objects") or []
         return []
 
+    def _load_robot_config(self) -> Dict[str, Any]:
+        if self._robot_config is not None:
+            return self._robot_config
+        if self._robot_config_path.exists():
+            self._robot_config = yaml.safe_load(self._robot_config_path.read_text()) or {}
+        else:
+            self._robot_config = {}
+        return self._robot_config
+
     def _build_prompt(
         self,
         task: str,
         objects: List[Dict[str, Any]],
         template: str,
+        registry: Any = None,
+        robot_config: Optional[Dict[str, Any]] = None,
     ) -> str:
         lines = []
         for obj in objects:
@@ -130,7 +148,45 @@ class TaskParser:
             pos_str = f"  pos={pos}" if pos else ""
             lines.append(f"  - {obj.get('object_id')} ({obj.get('object_type')}){pos_str}")
         object_list = "\n".join(lines) if lines else "  (none detected)"
-        return template.replace("{task}", task).replace("{object_list}", object_list)
+
+        # Build spatial relations from contact graph support_tree if available.
+        spatial_lines = []
+        cg = getattr(registry, "contact_graph", None) if registry is not None else None
+        if cg is not None:
+            support_tree = getattr(cg, "support_tree", {}) or {}
+            for lower_id, upper_ids in support_tree.items():
+                for upper_id in upper_ids:
+                    spatial_lines.append(f"  - {lower_id} supports {upper_id}  (i.e. {upper_id} is on top of {lower_id})")
+        spatial_relations = "\n".join(spatial_lines) if spatial_lines else "  (none detected)"
+
+        # Build robot constraints as a rule paragraph injected into Rule 5.
+        rc = robot_config or {}
+        caps = rc.get("capabilities", {})
+        max_held = caps.get("max_held_objects", 1)
+        bimanual = caps.get("bimanual", False)
+        constraint_lines = [f"Robot constraints ({rc.get('name', 'unknown')}):"]
+        if max_held == 1:
+            constraint_lines.append(
+                "     ⚠ SINGLE GRIPPER: the robot can hold at most 1 object at a time. "
+                "The gripper MUST be empty before grasping a new object. "
+                "Any pick_up action must be preceded by a place action if the gripper is already holding something. "
+                "Exception: tool use (e.g. holding a tool to interact with another object without releasing the tool)."
+            )
+        else:
+            constraint_lines.append(f"     Max objects held simultaneously: {max_held}.")
+        if not bimanual:
+            constraint_lines.append(
+                "     ⚠ NO BIMANUAL: all actions use a single arm — no simultaneous two-handed operations."
+            )
+        robot_constraints = "\n".join(constraint_lines)
+
+        return (
+            template
+            .replace("{task}", task)
+            .replace("{object_list}", object_list)
+            .replace("{spatial_relations}", spatial_relations)
+            .replace("{robot_constraints}", robot_constraints)
+        )
 
     def _parse_response(self, raw: str) -> TaskParseResult:
         data = json.loads(raw)
@@ -142,6 +198,7 @@ class TaskParser:
                 action=a["action"],
                 object_id=a.get("object_id"),
                 description=a.get("description", ""),
+                secondary_object_id=a.get("secondary_object_id"),
             )
             for a in data.get("actions", [])
         ]

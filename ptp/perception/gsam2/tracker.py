@@ -26,7 +26,7 @@ if torch.cuda.get_device_properties(0).major >= 8:
 class GroundingDinoPredictor:
     """Wrapper for GroundingDINO zero-shot object detection."""
 
-    def __init__(self, model_id="IDEA-Research/grounding-dino-tiny", device="cuda"):
+    def __init__(self, model_id=os.environ.get("DINO_CKPT", "IDEA-Research/grounding-dino-tiny"), device="cuda"):
         self.device = device
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
@@ -95,7 +95,7 @@ class SAM2ImageSegmentor:
 class IncrementalObjectTracker:
     def __init__(
         self,
-        grounding_model_id="IDEA-Research/grounding-dino-tiny",
+        grounding_model_id=os.environ.get("DINO_CKPT", "IDEA-Research/grounding-dino-tiny"),
         sam2_model_cfg=os.environ.get("SAM2_CFG", "configs/sam2.1/sam2.1_hiera_b+.yaml"),
         sam2_ckpt_path=os.environ.get("SAM2_CKPT", "./checkpoints/sam2.1_hiera_base_plus.pt"),
         device="cuda",

@@ -205,7 +205,6 @@ def _iter_grasps(
     v = np.cross(approach, u);   v /= np.linalg.norm(v) + 1e-9
 
     half_width   = _GRIPPER_WIDTH_M / 2.0
-    floor_clr_z  = _FINGER_THICKNESS_M
 
     env_bodies, floor_body = planner._build_collision_bodies(ignore_labels=ignore_labels)
     n_links = __import__("pybullet").getNumJoints(planner._robot_id,
@@ -230,10 +229,13 @@ def _iter_grasps(
         else:
             grasp_center, jaw_spread = contact_position.copy(), 0.0
 
-        # Floor clearance
+        # Floor clearance — reject only if jaws would go below the world floor (z < 0).
+        # The finger-thickness offset is intentionally omitted here because for top-down
+        # grasps the approach vector already keeps fingers above the object; applying a
+        # positive z threshold incorrectly filters all candidates on low-height objects.
         jaw_a = grasp_center + half_width * grasp_axis
         jaw_b = grasp_center - half_width * grasp_axis
-        if min(jaw_a[2], jaw_b[2]) < floor_clr_z:
+        if min(jaw_a[2], jaw_b[2]) < 0.0:
             continue
 
         # Build quaternion

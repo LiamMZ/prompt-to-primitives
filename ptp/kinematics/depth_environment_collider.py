@@ -26,7 +26,7 @@ Typical usage::
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Dict, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, Optional, Set
 
 import numpy as np
 
@@ -52,11 +52,12 @@ logger = logging.getLogger(__name__)
 _DEPTH_MIN_M = 0.15
 _DEPTH_MAX_M = 2.0
 _DEPTH_STRIDE = 2              # reduced from 4 — 4× more points, better coverage of small/far objects
-_VOXEL_SIZE_M = 0.003          # downsample to 3 mm grid before BPA to normalise point spacing
-_BPA_RADIUS_FACTOR_OBJ = 1.5   # tighter ball for per-object meshes — prevents gap-spanning fins
-_BPA_RADIUS_FACTOR_BG  = 2.0   # looser ball for background — larger surfaces tolerate more gap
-_BPA_RADIUS_MAX_M = 0.04       # hard cap: ball never spans more than 4 cm
+_VOXEL_SIZE_M = 0.003          # downsample to 3 mm grid before reconstruction
+_BPA_RADIUS_FACTOR_BG  = 2.0   # BPA ball factor for background — large flat surfaces
+_BPA_RADIUS_MAX_M = 0.04       # BPA hard cap: ball never spans more than 4 cm
 _LONG_EDGE_FACTOR = 4.0        # triangles whose longest edge > factor × mean_spacing are artifacts
+_POISSON_DEPTH = 7             # Poisson octree depth — higher = more detail, slower (6–9 range)
+_POISSON_DENSITY_QUANTILE = 0.05  # remove lowest-density vertices (fills holes, removes spikey edges)
 _MIN_COMPONENT_TRIS_RATIO = 0.02  # min component size as fraction of total triangles (floor: 8)
 _MIN_COMPONENT_TRIS_FLOOR = 8  # absolute minimum — avoids pruning everything on small objects
 _OUTLIER_NB_POINTS = 16        # statistical outlier removal neighbour count
@@ -64,10 +65,16 @@ _OUTLIER_STD_RATIO = 1.5       # points beyond mean + ratio×std are removed
 _COLLISION_MARGIN_M = 0.005
 _WORLD_Z_MIN_M = -0.10          # discard points below this (noise/mis-projection below table)
 _WORLD_Z_MAX_M = 1.0            # discard points above the workspace ceiling
-# Pixels within this many pixels of any object mask edge are excluded from the
-# background mesh.  Depth sensors bleed values behind objects at silhouette
-# edges; eroding the exclusion zone removes those leaked pixels before BPA.
-_MASK_ERODE_PX = 6
+# Pixels within this many pixels of any object mask edge are excluded.
+# RealSense IR-based depth bleeds interpolated values at silhouette boundaries;
+# eroding the mask removes those pixels before reconstruction.
+_MASK_ERODE_OBJ_PX = 4         # erosion on per-object masks
+_MASK_ERODE_PX = 6             # erosion used for background exclusion zone
+# Flying-pixel filter: remove depth pixels whose value differs from the local
+# median by more than this fraction.  Edge bleed pixels sit between foreground
+# and background depth and are caught by this test.
+_FLYING_PIXEL_MEDIAN_RADIUS = 3   # local median window half-size in pixels
+_FLYING_PIXEL_DEPTH_FRAC = 0.10   # reject if |d - median| / median > this
 # Background points whose depth exceeds the minimum object depth at the same
 # pixel (scaled by this factor) are occluded and removed.  1.0 = exact, values
 # slightly above 1.0 give a small tolerance for sensor noise.
@@ -94,6 +101,7 @@ class DepthEnvironmentCollider:
         self,
         planner: BasePybulletInterface,
         collision_margin_m: float = _COLLISION_MARGIN_M,
+        sam3d: Optional[Any] = None,
     ) -> None:
         if not _O3D_AVAILABLE:
             raise ImportError("open3d is required: pip install open3d")
@@ -105,6 +113,9 @@ class DepthEnvironmentCollider:
         # object_id (or BACKGROUND_ID) -> pybullet body ID
         self._bodies: Dict[str, int] = {}
         self._cam_pos_world: Optional[np.ndarray] = None
+        # Optional Sam3DMeshifier — when set, per-object meshes come from SAM3D
+        # rather than convex hull of depth back-projection.
+        self._sam3d = sam3d
 
     # ------------------------------------------------------------------
     # Public API
@@ -153,6 +164,7 @@ class DepthEnvironmentCollider:
         intrinsics: CameraIntrinsics,
         masks: Dict[str, np.ndarray],
         debug_dir: Optional[str] = None,
+        color_image: Optional[np.ndarray] = None,
     ) -> Dict[str, bool]:
         """Rebuild from an already-captured depth array.
 
@@ -161,6 +173,8 @@ class DepthEnvironmentCollider:
             intrinsics: Camera intrinsic parameters.
             masks: {object_id: bool H×W mask}.
             debug_dir: If given, write ``depth_debug.png`` into this directory.
+            color_image: (H, W, 3) uint8 RGB image. Required when a SAM3D
+                meshifier is attached; ignored otherwise.
 
         Returns:
             Dict mapping each label to True if its mesh was built successfully.
@@ -169,7 +183,10 @@ class DepthEnvironmentCollider:
         if T_base_cam is None:
             logger.warning("DepthEnvironmentCollider: cannot read camera extrinsic")
             return {}
-        return self._rebuild(depth_m, intrinsics, T_base_cam, masks, debug_dir=debug_dir)
+        return self._rebuild(
+            depth_m, intrinsics, T_base_cam, masks,
+            debug_dir=debug_dir, color_image=color_image,
+        )
 
     def check_trajectory(
         self,
@@ -417,6 +434,7 @@ class DepthEnvironmentCollider:
         T_base_cam: np.ndarray,
         masks: Dict[str, np.ndarray],
         debug_dir: Optional[str] = None,
+        color_image: Optional[np.ndarray] = None,
     ) -> Dict[str, bool]:
         self.remove()
         self._cam_pos_world = T_base_cam[:3, 3].copy()
@@ -431,14 +449,39 @@ class DepthEnvironmentCollider:
             if mask.shape == (h, w):
                 union_mask |= mask.astype(bool)
 
+        # Pre-compute SAM3D meshes for all objects if a meshifier is attached.
+        # Falls back to None per object on failure so depth convex hull is used.
+        sam3d_meshes: Dict[str, Optional[object]] = {}
+        if self._sam3d is not None and color_image is not None:
+            logger.info("DepthEnvironmentCollider: running SAM3D reconstruction for %d objects…",
+                        len(masks))
+            sam3d_meshes = self._sam3d.reconstruct_all(color_image, masks, T_base_cam)
+
+        # Pre-compute flying-pixel mask once — shared across all object masks.
+        flying_pixel_mask = self._flying_pixel_mask(depth_m)
+
         # Build one body per detected object.
         for obj_id, mask in masks.items():
             if mask.shape != (h, w):
                 logger.warning("DepthEnvironmentCollider: mask shape mismatch for %s", obj_id)
                 results[obj_id] = False
                 continue
+
+            sam3d_mesh = sam3d_meshes.get(obj_id)
+            if sam3d_mesh is not None:
+                # SAM3D produced a mesh — use it directly, skip depth back-projection.
+                results[obj_id] = self._build_body_from_mesh(sam3d_mesh, obj_id)
+                if results[obj_id]:
+                    continue
+                logger.warning(
+                    "DepthEnvironmentCollider: SAM3D mesh failed for %s — falling back to depth",
+                    obj_id,
+                )
+
+            obj_mask = self._erode_mask(mask.astype(bool), _MASK_ERODE_OBJ_PX)
+            obj_mask &= ~flying_pixel_mask
             pts, _, _ = self._depth_to_world_points(depth_m, intrinsics, T_base_cam,
-                                                     pixel_mask=mask.astype(bool))
+                                                     pixel_mask=obj_mask)
             results[obj_id] = self._build_body(pts, obj_id)
 
         # Build background body with two levels of occlusion filtering so the
@@ -628,6 +671,18 @@ class DepthEnvironmentCollider:
             return None, None, None
         return pts_world, rows_v, cols_v
 
+    def _build_body_from_mesh(self, mesh: Any, label: str) -> bool:
+        """Add a pre-built Open3D mesh to PyBullet. Returns success."""
+        body_id = self._mesh_to_pybullet(mesh, label=label)
+        if body_id is None:
+            return False
+        self._bodies[label] = body_id
+        logger.info(
+            "DepthEnvironmentCollider: [%s] (SAM3D) body=%d  triangles=%d",
+            label, body_id, len(np.asarray(mesh.triangles)),
+        )
+        return True
+
     def _build_body(self, pts: Optional[np.ndarray], label: str) -> bool:
         """Reconstruct mesh from points and add it to PyBullet. Returns success."""
         if pts is None or len(pts) < 10:
@@ -651,18 +706,46 @@ class DepthEnvironmentCollider:
         )
         return True
 
+    @staticmethod
+    def _erode_mask(mask: np.ndarray, px: int) -> np.ndarray:
+        """Morphologically erode a boolean mask by *px* pixels."""
+        if px <= 0:
+            return mask
+        try:
+            from scipy.ndimage import binary_erosion
+            struct = np.ones((2 * px + 1, 2 * px + 1), dtype=bool)
+            return binary_erosion(mask, structure=struct)
+        except ImportError:
+            return mask
+
+    def _flying_pixel_mask(self, depth_m: np.ndarray) -> np.ndarray:
+        """Return a boolean mask that is True for likely depth-bleed / flying pixels.
+
+        A pixel is flagged when its depth deviates from the local median by more
+        than _FLYING_PIXEL_DEPTH_FRAC of the median value.  These are the
+        interpolated edge pixels that RealSense produces at foreground/background
+        boundaries.
+        """
+        try:
+            from scipy.ndimage import median_filter
+        except ImportError:
+            return np.zeros(depth_m.shape, dtype=bool)
+
+        r = _FLYING_PIXEL_MEDIAN_RADIUS
+        local_median = median_filter(depth_m, size=2 * r + 1)
+        valid = local_median > 0
+        frac = np.zeros_like(depth_m)
+        frac[valid] = np.abs(depth_m[valid] - local_median[valid]) / local_median[valid]
+        return frac > _FLYING_PIXEL_DEPTH_FRAC
+
     def _points_to_mesh(self, pts: np.ndarray, is_background: bool = False) -> Optional[object]:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts)
 
-        # Voxel downsample to a uniform 3 mm grid so BPA ball radius is consistent
-        # regardless of object distance or stride density variation.
         pcd = pcd.voxel_down_sample(_VOXEL_SIZE_M)
         if len(pcd.points) < 10:
             return None
 
-        # Remove statistical outliers — eliminates isolated noise points at depth
-        # edges that BPA would otherwise bridge into phantom triangles.
         pcd, _ = pcd.remove_statistical_outlier(
             nb_neighbors=_OUTLIER_NB_POINTS,
             std_ratio=_OUTLIER_STD_RATIO,
@@ -678,40 +761,55 @@ class DepthEnvironmentCollider:
                 camera_location=self._cam_pos_world.tolist()
             )
 
-        distances = pcd.compute_nearest_neighbor_distance()
-        if len(distances) == 0:
-            return None
-        mean_spacing = float(np.mean(distances))
-        bpa_factor = _BPA_RADIUS_FACTOR_BG if is_background else _BPA_RADIUS_FACTOR_OBJ
-        radius = min(bpa_factor * mean_spacing, _BPA_RADIUS_MAX_M)
+        if is_background:
+            # BPA for background — Poisson fits poorly to open planar surfaces
+            # and creates undesirable geometry below the table plane.
+            distances = pcd.compute_nearest_neighbor_distance()
+            if len(distances) == 0:
+                return None
+            mean_spacing = float(np.mean(distances))
+            radius = min(_BPA_RADIUS_FACTOR_BG * mean_spacing, _BPA_RADIUS_MAX_M)
+            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+                pcd,
+                o3d.utility.DoubleVector([radius, radius * 2]),
+            )
+            if len(mesh.triangles) == 0:
+                return None
+            mesh.remove_degenerate_triangles()
+            mesh.remove_duplicated_vertices()
 
-        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
-            pcd,
-            o3d.utility.DoubleVector([radius, radius * 2]),
-        )
-        if len(mesh.triangles) == 0:
-            return None
+            # Remove long-edge artifacts on background.
+            verts = np.asarray(mesh.vertices)
+            tris = np.asarray(mesh.triangles)
+            v0, v1, v2 = verts[tris[:, 0]], verts[tris[:, 1]], verts[tris[:, 2]]
+            longest = np.maximum(
+                np.linalg.norm(v1 - v0, axis=1),
+                np.maximum(np.linalg.norm(v2 - v1, axis=1), np.linalg.norm(v0 - v2, axis=1)),
+            )
+            max_edge = _LONG_EDGE_FACTOR * mean_spacing
+            mesh.remove_triangles_by_index(np.where(longest > max_edge)[0].tolist())
+            mesh.remove_unreferenced_vertices()
+            if len(mesh.triangles) == 0:
+                return None
+        else:
+            # Poisson surface reconstruction for objects — produces a smooth,
+            # watertight surface that tolerates partial visibility and noisy depth.
+            mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                pcd, depth=_POISSON_DEPTH, linear_fit=False
+            )
+            if len(mesh.triangles) == 0:
+                return None
+            # Trim low-density vertices — these are extrapolated regions Poisson
+            # invented to close holes.  Removing them prunes phantom geometry
+            # that extends well past the visible surface.
+            densities = np.asarray(densities)
+            threshold = np.quantile(densities, _POISSON_DENSITY_QUANTILE)
+            verts_to_remove = densities < threshold
+            mesh.remove_vertices_by_mask(verts_to_remove)
+            if len(mesh.triangles) == 0:
+                return None
 
-        mesh.remove_degenerate_triangles()
-        mesh.remove_duplicated_vertices()
-
-        # Remove triangles whose longest edge exceeds the artifact threshold.
-        # These are BPA fins that span depth discontinuities or large point gaps.
-        verts = np.asarray(mesh.vertices)
-        tris = np.asarray(mesh.triangles)
-        max_edge = _LONG_EDGE_FACTOR * mean_spacing
-        v0, v1, v2 = verts[tris[:, 0]], verts[tris[:, 1]], verts[tris[:, 2]]
-        longest = np.maximum(
-            np.linalg.norm(v1 - v0, axis=1),
-            np.maximum(np.linalg.norm(v2 - v1, axis=1), np.linalg.norm(v0 - v2, axis=1)),
-        )
-        mesh.remove_triangles_by_index(np.where(longest > max_edge)[0].tolist())
-        mesh.remove_unreferenced_vertices()
-        if len(mesh.triangles) == 0:
-            return None
-
-        # Remove small disconnected components — noise islands left after edge filtering.
-        # Threshold scales with total triangle count so small objects aren't over-pruned.
+        # Remove small disconnected components (applies to both paths).
         triangle_clusters, cluster_n_tris, _ = mesh.cluster_connected_triangles()
         triangle_clusters = np.asarray(triangle_clusters)
         cluster_n_tris = np.asarray(cluster_n_tris)

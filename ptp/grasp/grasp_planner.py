@@ -112,7 +112,7 @@ class GraspPlanner:
         seed_jaw = seed_rot.apply(np.array([1.0, 0.0, 0.0]))
         u, v = self._perp_frame_from_seed(approach, seed_jaw)
 
-        floor_clearance_z = floor_z + finger_thickness_m
+        floor_clearance_z = floor_z
         half_width        = gripper_width_m / 2.0
         angles            = np.linspace(0.0, math.pi, n_rotations, endpoint=False)
 
