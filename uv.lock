@@ -2195,8 +2195,8 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "qpsolvers", extras = ["quadprog"], specifier = ">=4.3.1" },
     { name = "ram", git = "https://github.com/xinyu1205/recognize-anything.git" },
-    { name = "robocasa", editable = "../../installs/robocasa" },
-    { name = "robosuite", editable = "../../installs/robosuite" },
+    { name = "robocasa", editable = "/home/liam/installs/robocasa" },
+    { name = "robosuite", editable = "/home/liam/installs/robosuite" },
     { name = "sam2", specifier = ">=1.0.0" },
     { name = "scikit-learn", specifier = ">=1.3.0" },
     { name = "scipy", specifier = ">=1.11.0" },
@@ -2673,8 +2673,8 @@ wheels = [
 
 [[package]]
 name = "robocasa"
-version = "1.0.0"
-source = { editable = "../../installs/robocasa" }
+version = "1.0.1"
+source = { editable = "/home/liam/installs/robocasa" }
 dependencies = [
     { name = "gymnasium", marker = "sys_platform == 'linux'" },
     { name = "h5py", marker = "sys_platform == 'linux'" },
@@ -2721,7 +2721,7 @@ requires-dist = [
 [[package]]
 name = "robosuite"
 version = "1.5.2"
-source = { editable = "../../installs/robosuite" }
+source = { editable = "/home/liam/installs/robosuite" }
 dependencies = [
     { name = "mujoco", marker = "sys_platform == 'linux'" },
     { name = "numba", marker = "sys_platform == 'linux'" },

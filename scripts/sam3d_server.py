@@ -42,6 +42,16 @@ import io
 import logging
 import os
 import sys
+from pathlib import Path
+
+# inference.py lives in the notebook/ subdirectory of the sam-3d-objects repo.
+# Add it to sys.path so `from inference import Inference` works regardless of
+# where this script is invoked from.
+_here = Path(__file__).resolve().parent
+for _candidate in [_here / "notebook", _here.parent / "notebook"]:
+    if _candidate.exists():
+        sys.path.insert(0, str(_candidate))
+        break
 
 logging.basicConfig(
     level=logging.INFO,

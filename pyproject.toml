@@ -71,7 +71,7 @@ robosuite = { path = "/home/liam/installs/robosuite", editable = true }
 robocasa  = { path = "/home/liam/installs/robocasa",  editable = true }
 
 [tool.uv]
-environments = ["sys_platform == 'linux'"]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 
 # robocasa pins lerobot==0.3.3 and tianshou==0.4.10 which cap torch<2.8.
 # override-dependencies forces these versions regardless of what robocasa requests,
