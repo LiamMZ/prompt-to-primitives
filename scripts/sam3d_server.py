@@ -159,7 +159,11 @@ def _run_inference(
     import open3d as o3d
     import tempfile
 
-    output = model(image_arr, mask_arr, seed=seed, pointmap=pointmap, intrinsic=intrinsic)
+    try:
+        output = model(image_arr, mask_arr, seed=seed, pointmap=pointmap, intrinsic=intrinsic)
+    except TypeError:
+        # Older Inference versions don't accept intrinsic — fall back to pointmap only.
+        output = model(image_arr, mask_arr, seed=seed, pointmap=pointmap)
 
     mesh_glb = output.get("glb")
     if mesh_glb is None:

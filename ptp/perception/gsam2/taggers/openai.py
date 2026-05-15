@@ -85,7 +85,8 @@ class OpenAITagger(BaseTagger):
         """
         prompts = self._load_prompts()
         if task:
-            system_prompt = prompts.get("task_focused_prompt", "").strip().format(task=task)
+            template = prompts.get("task_focused_prompt", "").strip()
+            system_prompt = template.replace("{task}", task)
         else:
             system_prompt = prompts.get("system_prompt", "").strip()
 

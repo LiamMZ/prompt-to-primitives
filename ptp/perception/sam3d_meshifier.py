@@ -296,6 +296,7 @@ class Sam3DMeshifier:
     ) -> Optional[object]:
         import urllib.request
         import json
+        import urllib.error
         import open3d as o3d
         from PIL import Image as _PIL
 
@@ -337,6 +338,12 @@ class Sam3DMeshifier:
         try:
             with urllib.request.urlopen(req, timeout=120) as r:
                 body = json.loads(r.read())
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.loads(exc.read()).get("error", str(exc))
+            except Exception:
+                detail = str(exc)
+            raise RuntimeError(f"SAM3D server error {exc.code}: {detail}") from exc
         except Exception as exc:
             raise RuntimeError(f"SAM3D server request failed: {exc}") from exc
 
