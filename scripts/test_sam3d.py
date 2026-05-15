@@ -45,11 +45,16 @@ def parse_args() -> argparse.Namespace:
                    default=os.environ.get("SAM3D_SERVERS",
                            os.environ.get("SAM3D_SERVER", "http://192.168.0.88:8766")),
                    help="Comma-separated SAM3D server URLs (default: $SAM3D_SERVERS or $SAM3D_SERVER)")
+    p.add_argument("--single-gpu", action="store_true",
+                   help="Use only the first server URL (for debugging on one GPU)")
     p.add_argument("--synthetic", action="store_true",
                    help="Use a synthetic image + centre-crop mask (no camera needed)")
     p.add_argument("--no-viz", action="store_true",
                    help="Skip PyBullet GUI and matplotlib display")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.single_gpu:
+        args.server = args.server.split(",")[0]
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -215,29 +220,46 @@ def load_into_pybullet(meshes_positioned: dict) -> None:
     import pybullet as p
     import pybullet_data
     import numpy as np
+    import open3d as o3d
+    import tempfile
+    import os
 
     client = p.connect(p.GUI)
     p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client)
     p.setGravity(0, 0, -9.81, physicsClientId=client)
     p.loadURDF("plane.urdf", physicsClientId=client)
 
+    tmp_files = []
     for i, (obj_id, mesh) in enumerate(meshes_positioned.items()):
         verts = np.asarray(mesh.vertices, dtype=np.float64)
         tris = np.asarray(mesh.triangles, dtype=np.int32)
         if len(verts) == 0 or len(tris) == 0:
             continue
 
+        # Collision: decimate to stay within PyBullet's inline vertex limit.
+        col_mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=500)
+        col_mesh.remove_degenerate_triangles()
+        col_verts = np.asarray(col_mesh.vertices, dtype=np.float64)
+        col_tris = np.asarray(col_mesh.triangles, dtype=np.int32)
+        if len(col_verts) == 0 or len(col_tris) == 0:
+            col_verts, col_tris = verts, tris
+
+        # Visual: write full mesh to a temp .obj so PyBullet loads it from file.
+        tmp = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
+        tmp.close()
+        o3d.io.write_triangle_mesh(tmp.name, mesh)
+        tmp_files.append(tmp.name)
+
         r, g, b, a = _PALETTE[i % len(_PALETTE)]
         col = p.createCollisionShape(
             p.GEOM_MESH,
-            vertices=verts.tolist(),
-            indices=tris.flatten().tolist(),
+            vertices=col_verts.tolist(),
+            indices=col_tris.flatten().tolist(),
             physicsClientId=client,
         )
         vis = p.createVisualShape(
             p.GEOM_MESH,
-            vertices=verts.tolist(),
-            indices=tris.flatten().tolist(),
+            fileName=tmp.name,
             rgbaColor=[r, g, b, a],
             physicsClientId=client,
         )
@@ -250,8 +272,8 @@ def load_into_pybullet(meshes_positioned: dict) -> None:
             baseOrientation=[0, 0, 0, 1],
             physicsClientId=client,
         )
-        logger.info("PyBullet: loaded %s at %.3f,%.3f,%.3f  (%d tris)",
-                    obj_id, *centroid, len(tris))
+        logger.info("PyBullet: loaded %s at %.3f,%.3f,%.3f  (%d tris, %d col tris)",
+                    obj_id, *centroid, len(tris), len(col_tris))
 
     logger.info("PyBullet GUI open — press Ctrl+C to exit.")
     try:
@@ -260,6 +282,8 @@ def load_into_pybullet(meshes_positioned: dict) -> None:
     except KeyboardInterrupt:
         pass
     p.disconnect(client)
+    for f in tmp_files:
+        os.unlink(f)
 
 
 # ---------------------------------------------------------------------------
@@ -313,19 +337,20 @@ def main() -> None:
 
     T_base_cam = np.eye(4)
     logger.info("Reconstructing %d object(s) via SAM3D …", len(valid_masks))
-    meshes = meshifier.reconstruct_all(color, valid_masks, T_base_cam)
+    meshes = meshifier.reconstruct_all(
+        color, valid_masks, T_base_cam, depth_m=depth, intrinsics=intrinsics
+    )
 
-    # Scale and position each mesh
     meshes_positioned = {}
     for obj_id, mesh in meshes.items():
         if mesh is None:
             logger.warning("SAM3D failed for %s", obj_id)
             continue
         mesh.compute_vertex_normals()
-        fit_mesh_to_depth(mesh, centroids[obj_id], extents[obj_id])
         meshes_positioned[obj_id] = mesh
-        logger.info("  %s: centroid=%.3f,%.3f,%.3f  extent=%.3f,%.3f,%.3f",
-                    obj_id, *centroids[obj_id], *extents[obj_id])
+        verts = np.asarray(mesh.vertices)
+        centroid = verts.mean(axis=0)
+        logger.info("  %s: centroid=%.3f,%.3f,%.3f", obj_id, *centroid)
 
     if not meshes_positioned:
         logger.error("No meshes to load.")

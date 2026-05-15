@@ -20,11 +20,14 @@ prefix() {
 }
 
 start_server() {
-    local gpu=$1 port=$2 label="[GPU${gpu}|${port}]"
+    local gpu=$1
+    local port=$2
+    local label="[GPU${gpu}|${port}]"
     conda run -n "$CONDA_ENV" env \
         CUDA_VISIBLE_DEVICES=$gpu \
         PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-        python "$SERVER_SCRIPT" \
+        PYTHONUNBUFFERED=1 \
+        python -u "$SERVER_SCRIPT" \
         --host 0.0.0.0 --port "$port" --checkpoint "$CHECKPOINT" 2>&1 | prefix "$label" &
     echo "$label started (pid $!)"
 }
@@ -36,6 +39,10 @@ until curl -sf http://127.0.0.1:8766/health > /dev/null 2>&1; do sleep 2; done
 echo "[GPU0|8766] ready"
 
 start_server 1 8767
+
+echo "Waiting for GPU1 server to be ready …"
+until curl -sf http://127.0.0.1:8767/health > /dev/null 2>&1; do sleep 2; done
+echo "[GPU1|8767] ready"
 
 trap "echo 'Stopping servers…'; kill -- -$$ 2>/dev/null; wait" SIGINT SIGTERM
 

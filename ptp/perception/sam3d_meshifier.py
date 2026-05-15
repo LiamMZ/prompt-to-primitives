@@ -250,9 +250,10 @@ class Sam3DMeshifier:
         pointmap = np.stack([-(u - cx) / fx * z, -(v - cy) / fy * z, z], axis=-1)
         K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
 
+        import torch
         output = self._inference(
             color_rgb.astype(np.uint8), mask.astype(np.uint8),
-            seed=seed, pointmap=pointmap, intrinsic=K,
+            seed=seed, pointmap=torch.from_numpy(pointmap).float(),
         )
 
         mesh_glb = output.get("glb")
@@ -372,25 +373,31 @@ class Sam3DMeshifier:
             vertices → flip_z → yup_to_zup → scale/rotate/translate → pytorch3d_to_cam
         """
         import torch
-        from pytorch3d.transforms import quaternion_to_matrix, Transform3d
+        from pytorch3d.transforms import quaternion_to_matrix
+
+        def _t(x):
+            if isinstance(x, torch.Tensor):
+                return x.detach().cpu().float()
+            return torch.tensor(np.asarray(x), dtype=torch.float32)
 
         R_flip_z     = torch.tensor([[1,0,0],[0,1,0],[0,0,-1]], dtype=torch.float32)
         R_yup_to_zup = torch.tensor([[-1,0,0],[0,0,1],[0,1,0]], dtype=torch.float32).T
         R_p3d_to_cam = torch.tensor([[-1,0,0],[0,-1,0],[0,0,1]], dtype=torch.float32)
 
-        verts = torch.tensor(vertices, dtype=torch.float32).unsqueeze(0)
+        verts = torch.tensor(vertices, dtype=torch.float32)  # (N, 3)
         verts = verts @ R_flip_z
         verts = verts @ R_yup_to_zup
 
-        S = output["scale"][0].cpu().float()
-        T = output["translation"][0].cpu().float()
-        R = output["rotation"].squeeze().cpu().float()
-        R_mat = quaternion_to_matrix(R)
+        S     = _t(output["scale"]).flatten()[0]          # scalar
+        T     = _t(output["translation"]).flatten()[:3]   # (3,)
+        R     = _t(output["rotation"]).flatten()[:4]      # quaternion (4,)
+        R_mat = quaternion_to_matrix(R)                    # (3, 3)
 
-        tfm = Transform3d(dtype=torch.float32).scale(S).rotate(R_mat).translate(*T)
-        verts = tfm.transform_points(verts)
+        verts = verts * S
+        verts = verts @ R_mat
+        verts = verts + T
         verts = verts @ R_p3d_to_cam
-        return verts[0].cpu().numpy().astype(np.float32)
+        return verts.numpy().astype(np.float32)
 
     @staticmethod
     def _pcd_to_mesh(pcd: Any) -> Optional[Any]:
