@@ -113,13 +113,23 @@ class DepthEnvironmentCollider:
         # object_id (or BACKGROUND_ID) -> pybullet body ID
         self._bodies: Dict[str, int] = {}
         self._cam_pos_world: Optional[np.ndarray] = None
-        # Optional Sam3DMeshifier — when set, per-object meshes come from SAM3D
-        # rather than convex hull of depth back-projection.
+        # Optional Sam3DMeshifier — when set, per-object meshes come from SAM3D.
         self._sam3d = sam3d
+        # When set, only these object IDs are sent to SAM3D; others use depth Poisson.
+        # None means all objects are eligible.
+        self._sam3d_ids: Optional[Set[str]] = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def set_sam3d_eligible(self, object_ids: Optional[Set[str]]) -> None:
+        """Restrict SAM3D reconstruction to a specific subset of object IDs.
+
+        Objects not in the set fall back to depth Poisson reconstruction.
+        Pass None to make all objects eligible (default).
+        """
+        self._sam3d_ids = set(object_ids) if object_ids is not None else None
 
     @property
     def object_ids(self) -> list[str]:
@@ -449,13 +459,23 @@ class DepthEnvironmentCollider:
             if mask.shape == (h, w):
                 union_mask |= mask.astype(bool)
 
-        # Pre-compute SAM3D meshes for all objects if a meshifier is attached.
-        # Falls back to None per object on failure so depth convex hull is used.
+        # Pre-compute SAM3D meshes for the eligible subset of objects.
+        # Non-eligible objects fall back to the depth Poisson path automatically.
         sam3d_meshes: Dict[str, Optional[object]] = {}
         if self._sam3d is not None and color_image is not None:
-            logger.info("DepthEnvironmentCollider: running SAM3D reconstruction for %d objects…",
-                        len(masks))
-            sam3d_meshes = self._sam3d.reconstruct_all(color_image, masks, T_base_cam)
+            sam3d_masks = {
+                k: v for k, v in masks.items()
+                if self._sam3d_ids is None or k in self._sam3d_ids
+            }
+            if sam3d_masks:
+                logger.info(
+                    "DepthEnvironmentCollider: running SAM3D reconstruction for %d/%d objects: %s",
+                    len(sam3d_masks), len(masks), list(sam3d_masks),
+                )
+                sam3d_meshes = self._sam3d.reconstruct_all(
+                    color_image, sam3d_masks, T_base_cam,
+                    depth_m=depth_m, intrinsics=intrinsics,
+                )
 
         # Pre-compute flying-pixel mask once — shared across all object masks.
         flying_pixel_mask = self._flying_pixel_mask(depth_m)

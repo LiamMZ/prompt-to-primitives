@@ -28,6 +28,7 @@ class BaseTagger(ABC):
         self,
         rgb_image: np.ndarray,
         required_tags: list[str] | None = None,
+        task: str | None = None,
     ) -> tuple[str, str]:
         """
         Generate object labels for the given RGB image.
@@ -36,6 +37,9 @@ class BaseTagger(ABC):
             rgb_image: ``(H, W, 3)`` uint8 numpy array in RGB order.
             required_tags: Object names that must be included in the returned prompt
                 regardless of what the model detects (e.g. goal objects from the task).
+            task: Natural language task description. When provided, the tagger focuses
+                only on task-relevant objects and their blockers rather than listing
+                everything in the scene.
 
         Returns:
             ``(prompt_str, raw_str)`` — GroundingDINO-ready prompt and raw model output.
@@ -46,5 +50,6 @@ class BaseTagger(ABC):
         self,
         rgb_image: np.ndarray,
         required_tags: list[str] | None = None,
+        task: str | None = None,
     ) -> tuple[str, str]:
-        return self.tag(rgb_image, required_tags=required_tags)
+        return self.tag(rgb_image, required_tags=required_tags, task=task)

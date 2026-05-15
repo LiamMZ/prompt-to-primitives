@@ -29,7 +29,7 @@ import logging
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -108,6 +108,8 @@ class Sam3DMeshifier:
         mask: np.ndarray,
         T_base_cam: np.ndarray,
         seed: int = 42,
+        depth_m: Optional[np.ndarray] = None,
+        intrinsics: Optional[Any] = None,
     ) -> Optional[object]:
         """Reconstruct a single object mesh in the robot base frame.
 
@@ -116,12 +118,16 @@ class Sam3DMeshifier:
             mask: (H, W) bool mask selecting the object pixels.
             T_base_cam: (4, 4) homogeneous camera-to-base transform.
             seed: Random seed for reproducibility.
+            depth_m: (H, W) float32 depth image in metres. Used to scale and
+                localise the mesh to match the real object size and position.
+            intrinsics: Camera intrinsics (fx, fy, cx, cy). Required with depth_m.
 
         Returns:
             open3d.geometry.TriangleMesh in base frame, or None on failure.
         """
         try:
-            return self._reconstruct_one(color_rgb, mask, T_base_cam, seed)
+            return self._reconstruct_one(color_rgb, mask, T_base_cam, seed,
+                                         depth_m=depth_m, intrinsics=intrinsics)
         except Exception as exc:
             logger.warning("SAM3D reconstruction failed: %s", exc)
             return None
@@ -132,11 +138,18 @@ class Sam3DMeshifier:
         masks: Dict[str, np.ndarray],
         T_base_cam: np.ndarray,
         seed: int = 42,
+        depth_m: Optional[np.ndarray] = None,
+        intrinsics: Optional[Any] = None,
     ) -> Dict[str, Optional[object]]:
         """Reconstruct meshes for all objects in ``masks``.
 
         When multiple server URLs are configured, objects are distributed
         across servers and reconstructed in parallel.
+
+        Args:
+            depth_m: (H, W) float32 depth image in metres. Used to scale and
+                localise each mesh to match the real object size and position.
+            intrinsics: Camera intrinsics. Required with depth_m.
 
         Returns a dict mapping object_id → mesh (or None on per-object failure).
         """
@@ -144,11 +157,13 @@ class Sam3DMeshifier:
         n_servers = len(self._server_urls)
 
         if n_servers <= 1:
-            # Single server or local — sequential
             results: Dict[str, Optional[object]] = {}
             for obj_id, mask in items:
                 try:
-                    results[obj_id] = self._reconstruct_one(color_rgb, mask, T_base_cam, seed)
+                    results[obj_id] = self._reconstruct_one(
+                        color_rgb, mask, T_base_cam, seed,
+                        depth_m=depth_m, intrinsics=intrinsics,
+                    )
                 except Exception as exc:
                     logger.warning("SAM3D reconstruction failed for %r: %s", obj_id, exc)
                     results[obj_id] = None
@@ -159,7 +174,10 @@ class Sam3DMeshifier:
             url = self._server_urls[server_idx % n_servers]
             meshifier = Sam3DMeshifier(server_url=url)
             try:
-                return obj_id, meshifier._reconstruct_one(color_rgb, mask, T_base_cam, seed)
+                return obj_id, meshifier._reconstruct_one(
+                    color_rgb, mask, T_base_cam, seed,
+                    depth_m=depth_m, intrinsics=intrinsics,
+                )
             except Exception as exc:
                 logger.warning("SAM3D reconstruction failed for %r on %s: %s", obj_id, url, exc)
                 return obj_id, None
@@ -185,22 +203,22 @@ class Sam3DMeshifier:
         mask: np.ndarray,
         T_base_cam: np.ndarray,
         seed: int,
+        depth_m: Optional[np.ndarray] = None,
+        intrinsics: Optional[Any] = None,
     ) -> Optional[object]:
         if self.is_remote:
-            mesh = self._reconstruct_remote(color_rgb, mask, seed)
+            mesh = self._reconstruct_remote(color_rgb, mask, seed,
+                                            depth_m=depth_m, intrinsics=intrinsics)
         else:
             self.load()
-            mesh = self._reconstruct_local(color_rgb, mask, seed)
+            mesh = self._reconstruct_local(color_rgb, mask, seed,
+                                           depth_m=depth_m, intrinsics=intrinsics)
 
         if mesh is None or len(mesh.triangles) == 0:
             return None
 
-        # Place mesh at the depth-derived centroid of the mask, then transform
-        # into the robot base frame.
-        cam_translation = self._mask_centroid_cam(color_rgb, mask)
-        if cam_translation is None:
-            return None
-        mesh.translate(cam_translation)
+        # The server/local path applies SAM3D's own scale+rotation+translation in
+        # camera frame.  We only need to transform into robot base frame here.
         mesh.transform(T_base_cam)
         return mesh
 
@@ -213,37 +231,42 @@ class Sam3DMeshifier:
         color_rgb: np.ndarray,
         mask: np.ndarray,
         seed: int,
+        depth_m: Optional[np.ndarray] = None,
+        intrinsics: Optional[Any] = None,
     ) -> Optional[object]:
-        from PIL import Image as _PIL
-
-        output = self._inference(color_rgb.astype(np.uint8), mask.astype(np.uint8), seed=seed)
-        return self._output_to_open3d(output)
-
-    def _output_to_open3d(self, output: dict) -> Optional[object]:
         import open3d as o3d
 
-        gs = output.get("gs")
-        if gs is None:
+        if depth_m is None or intrinsics is None:
+            raise RuntimeError("depth_m and intrinsics are required for local SAM3D reconstruction")
+
+        H, W = depth_m.shape
+        u = np.arange(W)[None, :].repeat(H, axis=0).astype(np.float32)
+        v = np.arange(H)[:, None].repeat(W, axis=1).astype(np.float32)
+        fx = getattr(intrinsics, "fx", W / 2)
+        fy = getattr(intrinsics, "fy", H / 2)
+        cx = getattr(intrinsics, "ppx", getattr(intrinsics, "cx", W / 2))
+        cy = getattr(intrinsics, "ppy", getattr(intrinsics, "cy", H / 2))
+        z = depth_m.astype(np.float32)
+        pointmap = np.stack([-(u - cx) / fx * z, -(v - cy) / fy * z, z], axis=-1)
+        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+
+        output = self._inference(
+            color_rgb.astype(np.uint8), mask.astype(np.uint8),
+            seed=seed, pointmap=pointmap, intrinsic=K,
+        )
+
+        mesh_glb = output.get("glb")
+        if mesh_glb is None or len(mesh_glb.vertices) == 0:
             return None
 
-        import tempfile
-        if isinstance(gs, (str, Path)):
-            pcd = o3d.io.read_point_cloud(str(gs))
-        else:
-            with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as f:
-                gs_ply_path = f.name
-            try:
-                gs.save_ply(gs_ply_path)
-                pcd = o3d.io.read_point_cloud(gs_ply_path)
-            finally:
-                Path(gs_ply_path).unlink(missing_ok=True)
+        vertices = self._apply_sam3d_transform(np.asarray(mesh_glb.vertices), output)
+        faces = np.asarray(mesh_glb.faces).astype(np.int32)
 
-        if len(pcd.points) < 4:
-            return None
-
-        hull, _ = pcd.compute_convex_hull()
-        hull.orient_triangles()
-        return hull
+        o3d_mesh = o3d.geometry.TriangleMesh()
+        o3d_mesh.vertices = o3d.utility.Vector3dVector(vertices.astype(np.float64))
+        o3d_mesh.triangles = o3d.utility.Vector3iVector(faces)
+        o3d_mesh.compute_vertex_normals()
+        return o3d_mesh if len(o3d_mesh.triangles) > 0 else None
 
     # ------------------------------------------------------------------
     # Remote inference
@@ -268,25 +291,40 @@ class Sam3DMeshifier:
         color_rgb: np.ndarray,
         mask: np.ndarray,
         seed: int,
+        depth_m: Optional[np.ndarray] = None,
+        intrinsics: Optional[Any] = None,
     ) -> Optional[object]:
         import urllib.request
         import json
         import open3d as o3d
         from PIL import Image as _PIL
 
-        # Encode RGB image as PNG base64.
         buf = io.BytesIO()
         _PIL.fromarray(color_rgb.astype(np.uint8)).save(buf, format="PNG")
         image_b64 = base64.b64encode(buf.getvalue()).decode()
 
-        # Encode mask as single-channel PNG base64.
         mask_buf = io.BytesIO()
         _PIL.fromarray((mask.astype(np.uint8) * 255)).save(mask_buf, format="PNG")
         mask_b64 = base64.b64encode(mask_buf.getvalue()).decode()
 
+        if depth_m is None or intrinsics is None:
+            raise RuntimeError("depth_m and intrinsics are required for SAM3D remote reconstruction")
+
+        depth_buf = io.BytesIO()
+        np.savez_compressed(depth_buf, depth_m=depth_m.astype(np.float32))
+        depth_b64 = base64.b64encode(depth_buf.getvalue()).decode()
+
+        fx = getattr(intrinsics, "fx", None)
+        fy = getattr(intrinsics, "fy", None)
+        cx = getattr(intrinsics, "ppx", getattr(intrinsics, "cx", None))
+        cy = getattr(intrinsics, "ppy", getattr(intrinsics, "cy", None))
+        K = [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]]
+
         payload = json.dumps({
             "image_b64": image_b64,
             "mask_b64": mask_b64,
+            "depth_b64": depth_b64,
+            "intrinsic": K,
             "seed": seed,
         }).encode()
 
@@ -319,14 +357,150 @@ class Sam3DMeshifier:
     # Shared helpers
     # ------------------------------------------------------------------
 
-    def _mask_centroid_cam(
-        self,
-        color_rgb: np.ndarray,
+    @staticmethod
+    def _apply_sam3d_transform(vertices: np.ndarray, output: dict) -> np.ndarray:
+        """Apply SAM3D's predicted scale/rotation/translation to mesh vertices.
+
+        Replicates the transform pipeline from the SAM3D reference notebook:
+            vertices → flip_z → yup_to_zup → scale/rotate/translate → pytorch3d_to_cam
+        """
+        import torch
+        from pytorch3d.transforms import quaternion_to_matrix, Transform3d
+
+        R_flip_z     = torch.tensor([[1,0,0],[0,1,0],[0,0,-1]], dtype=torch.float32)
+        R_yup_to_zup = torch.tensor([[-1,0,0],[0,0,1],[0,1,0]], dtype=torch.float32).T
+        R_p3d_to_cam = torch.tensor([[-1,0,0],[0,-1,0],[0,0,1]], dtype=torch.float32)
+
+        verts = torch.tensor(vertices, dtype=torch.float32).unsqueeze(0)
+        verts = verts @ R_flip_z
+        verts = verts @ R_yup_to_zup
+
+        S = output["scale"][0].cpu().float()
+        T = output["translation"][0].cpu().float()
+        R = output["rotation"].squeeze().cpu().float()
+        R_mat = quaternion_to_matrix(R)
+
+        tfm = Transform3d(dtype=torch.float32).scale(S).rotate(R_mat).translate(*T)
+        verts = tfm.transform_points(verts)
+        verts = verts @ R_p3d_to_cam
+        return verts[0].cpu().numpy().astype(np.float32)
+
+    @staticmethod
+    def _pcd_to_mesh(pcd: Any) -> Optional[Any]:
+        """Convert a Gaussian splat point cloud to a smooth mesh via Poisson reconstruction."""
+        import open3d as o3d
+        import numpy as np
+
+        pcd = pcd.voxel_down_sample(0.003)
+        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=16, std_ratio=1.5)
+        if len(pcd.points) < 4:
+            return None
+
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=30)
+        )
+        pcd.orient_normals_consistent_tangent_plane(k=15)
+
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=7, linear_fit=False
+        )
+        if len(mesh.triangles) == 0:
+            return None
+
+        densities = np.asarray(densities)
+        threshold = np.quantile(densities, 0.05)
+        mesh.remove_vertices_by_mask(densities < threshold)
+
+        return mesh if len(mesh.triangles) > 0 else None
+
+    @staticmethod
+    def _mask_depth_points(
+        depth_m: np.ndarray,
         mask: np.ndarray,
+        intrinsics: Any,
     ) -> Optional[np.ndarray]:
+        """Back-project masked depth pixels to 3D camera-frame points."""
+        h, w = depth_m.shape
+        bool_mask = mask.astype(bool)
+        if bool_mask.shape != (h, w):
+            return None
+
+        ys, xs = np.where(bool_mask)
+        if len(ys) == 0:
+            return None
+
+        zs = depth_m[ys, xs].astype(float)
+        valid = (zs > 0.05) & np.isfinite(zs)
+        ys, xs, zs = ys[valid], xs[valid], zs[valid]
+        if len(zs) < 4:
+            return None
+
+        fx = getattr(intrinsics, "fx", w / 2)
+        fy = getattr(intrinsics, "fy", h / 2)
+        cx = getattr(intrinsics, "ppx", getattr(intrinsics, "cx", w / 2))
+        cy = getattr(intrinsics, "ppy", getattr(intrinsics, "cy", h / 2))
+
+        x = (xs.astype(float) - cx) * zs / fx
+        y = (ys.astype(float) - cy) * zs / fy
+        return np.stack([x, y, zs], axis=1).astype(np.float32)
+
+    @staticmethod
+    def _align_mesh_to_depth(mesh: Any, pts_cam: np.ndarray) -> None:
+        """Scale and translate a SAM3D mesh to match the depth point cloud in-place.
+
+        SAM3D returns a mesh in an arbitrary canonical coordinate frame — the shape
+        is correct but the scale and position are not.  We:
+          1. Centre the mesh at its own geometric centroid (remove canonical offset).
+          2. Scale it uniformly so its bounding-box extents match the depth cloud.
+          3. Translate it to the depth centroid in camera frame.
+        """
+        import open3d as o3d
+
+        verts = np.asarray(mesh.vertices)
+        if len(verts) == 0:
+            return
+
+        # 1. Centre mesh at its own centroid.
+        mesh_centroid = verts.mean(axis=0)
+        mesh.translate(-mesh_centroid)
+
+        # 2. Compute per-axis extents of the mesh and the depth cloud.
+        verts = np.asarray(mesh.vertices)  # re-read after translate
+        mesh_extents = verts.max(axis=0) - verts.min(axis=0)
+
+        depth_min = pts_cam.min(axis=0)
+        depth_max = pts_cam.max(axis=0)
+        depth_extents = depth_max - depth_min
+        depth_centroid = pts_cam.mean(axis=0)
+
+        # 3. Uniform scale: use the median ratio across axes to avoid outlier axes
+        #    (e.g. Z extent is often underestimated due to occlusion).
+        valid_axes = mesh_extents > 1e-4
+        if not valid_axes.any():
+            mesh.translate(depth_centroid)
+            return
+
+        ratios = depth_extents[valid_axes] / mesh_extents[valid_axes]
+        scale = float(np.median(ratios))
+        scale = max(0.01, min(scale, 5.0))  # clamp to sane range
+        mesh.scale(scale, center=np.zeros(3))
+
+        # 4. Translate to depth centroid.
+        mesh.translate(depth_centroid)
+
+        logger.debug(
+            "SAM3D align: mesh_extents=%s depth_extents=%s scale=%.3f centroid=%s",
+            np.round(mesh_extents, 3), np.round(depth_extents, 3),
+            scale, np.round(depth_centroid, 3),
+        )
+
+    @staticmethod
+    def _mask_centroid_cam_approx(mask: np.ndarray) -> Optional[np.ndarray]:
+        """Fallback: image-centre normalized position when no depth is available."""
         ys, xs = np.where(mask.astype(bool))
         if len(ys) == 0:
             return None
-        cy, cx = float(ys.mean()), float(xs.mean())
         h, w = mask.shape[:2]
-        return np.array([cx / w - 0.5, cy / h - 0.5, 0.0])
+        cy, cx = float(ys.mean()), float(xs.mean())
+        # Rough assumption: object is ~0.5 m away; gives a plausible camera-frame pos.
+        return np.array([(cx / w - 0.5) * 0.5, (cy / h - 0.5) * 0.5, 0.5])

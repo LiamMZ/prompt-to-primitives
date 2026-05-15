@@ -247,6 +247,7 @@ class GSAM2ObjectTracker:
         self._current_prompt: str = "object."
         self._frame_count: int = 0
         self._extra_tags: List[str] = []
+        self._task_description: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -254,6 +255,9 @@ class GSAM2ObjectTracker:
 
     def set_tagger(self, tagger_callable: Any) -> None:
         self._tagger = tagger_callable
+
+    def set_task_description(self, task: str) -> None:
+        self._task_description = task.strip() if task else None
 
     def set_extra_tags(self, tags: List[str]) -> None:
         self._extra_tags = [t.strip().lower() for t in tags if t.strip()]
@@ -320,7 +324,7 @@ class GSAM2ObjectTracker:
         if self._tagger is not None and self._frame_count % self.tag_interval == 0:
             _t0 = time.perf_counter()
             new_prompt, _ = await loop.run_in_executor(
-                None, self._tagger, rgb_np, self._extra_tags or None
+                None, self._tagger, rgb_np, self._extra_tags or None, self._task_description
             )
             _t_tag_s = time.perf_counter() - _t0
             if new_prompt:

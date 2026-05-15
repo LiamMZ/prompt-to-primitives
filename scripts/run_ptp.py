@@ -231,6 +231,7 @@ def detect_objects(
         compute_occlusion=False,
     )
     if task:
+        tracker.set_task_description(task)
         hints = _extract_noun_phrases(task)
         if hints:
             tracker.set_extra_tags(hints)

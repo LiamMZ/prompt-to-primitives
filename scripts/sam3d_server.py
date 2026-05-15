@@ -44,6 +44,8 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
+
 # inference.py lives in the notebook/ subdirectory of the sam-3d-objects repo.
 # Add it to sys.path so `from inference import Inference` works regardless of
 # where this script is invoked from.
@@ -97,49 +99,83 @@ def _load_model(checkpoint_dir: str, compile: bool = False):
     return model
 
 
-def _run_inference(model, pil_rgb, mask_arr, seed: int = 42) -> bytes:
-    """Run SAM3D inference and return the mesh as binary PLY bytes."""
+def _depth_to_pointmap(depth: np.ndarray, K: np.ndarray) -> np.ndarray:
+    """Back-project depth to a SAM3D-convention pointmap [-x, -y, z] (H, W, 3)."""
+    H, W = depth.shape
+    u = np.arange(W)[None, :].repeat(H, axis=0).astype(np.float32)
+    v = np.arange(H)[:, None].repeat(W, axis=1).astype(np.float32)
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    z = depth.astype(np.float32)
+    x = (u - cx) / fx * z
+    y = (v - cy) / fy * z
+    return np.stack([-x, -y, z], axis=-1)
+
+
+def _apply_sam3d_transform(vertices, output: dict) -> np.ndarray:
+    """Apply SAM3D's predicted scale/rotation/translation to mesh vertices.
+
+    Replicates the transform pipeline from the reference RGBD3DReconstructor:
+        vertices → flip_z → yup_to_zup → scale/rotate/translate → pytorch3d_to_cam
+    """
+    import torch
+    from pytorch3d.transforms import quaternion_to_matrix, Transform3d
+
+    R_flip_z     = torch.tensor([[1,0,0],[0,1,0],[0,0,-1]], dtype=torch.float32)
+    R_yup_to_zup = torch.tensor([[-1,0,0],[0,0,1],[0,1,0]], dtype=torch.float32).T
+    R_p3d_to_cam = torch.tensor([[-1,0,0],[0,-1,0],[0,0,1]], dtype=torch.float32)
+
+    verts = torch.tensor(vertices, dtype=torch.float32).unsqueeze(0)
+    verts = verts @ R_flip_z
+    verts = verts @ R_yup_to_zup
+
+    S = output["scale"][0].cpu().float()
+    T = output["translation"][0].cpu().float()
+    R = output["rotation"].squeeze().cpu().float()
+    R_mat = quaternion_to_matrix(R)
+
+    tfm = Transform3d(dtype=torch.float32).scale(S).rotate(R_mat).translate(*T)
+    verts = tfm.transform_points(verts)
+    verts = verts @ R_p3d_to_cam
+    return verts[0].cpu().numpy().astype(np.float32)
+
+
+def _run_inference(
+    model,
+    image_arr: np.ndarray,
+    mask_arr: np.ndarray,
+    pointmap: np.ndarray,
+    intrinsic: np.ndarray,
+    seed: int = 42,
+) -> tuple:
+    """Run SAM3D inference with depth-derived pointmap and return PLY bytes."""
     import open3d as o3d
-    import numpy as np
-    from pathlib import Path
     import tempfile
 
-    image_arr = np.array(pil_rgb)
-    output = model(image_arr, mask_arr, seed=seed)
+    output = model(image_arr, mask_arr, seed=seed, pointmap=pointmap, intrinsic=intrinsic)
 
-    gs = output.get("gs")
-    if gs is None:
-        raise ValueError("SAM3D output missing 'gs' key")
+    mesh_glb = output.get("glb")
+    if mesh_glb is None:
+        raise ValueError("SAM3D output missing 'glb' key")
 
-    # Save the Gaussian splat to a temp PLY, then read back as a point cloud.
-    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as f:
-        gs_ply_path = f.name
-    try:
-        if isinstance(gs, (str, Path)):
-            gs_ply_path = str(gs)
-        else:
-            gs.save_ply(gs_ply_path)
-        pcd = o3d.io.read_point_cloud(gs_ply_path)
-    finally:
-        if not isinstance(gs, (str, Path)):
-            Path(gs_ply_path).unlink(missing_ok=True)
+    vertices = np.asarray(mesh_glb.vertices)
+    faces = np.asarray(mesh_glb.faces)
 
-    if len(pcd.points) < 4:
-        raise ValueError(f"Point cloud too sparse: {len(pcd.points)} points")
+    if len(vertices) == 0 or len(faces) == 0:
+        raise ValueError("SAM3D returned empty mesh")
 
-    hull, _ = pcd.compute_convex_hull()
-    hull.orient_triangles()
+    vertices = _apply_sam3d_transform(vertices, output)
 
-    if len(hull.triangles) == 0:
-        raise ValueError("Convex hull produced no triangles")
+    o3d_mesh = o3d.geometry.TriangleMesh()
+    o3d_mesh.vertices = o3d.utility.Vector3dVector(vertices.astype(np.float64))
+    o3d_mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+    o3d_mesh.compute_vertex_normals()
 
-    # Serialise to PLY bytes.
     with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as f:
         tmp_path = f.name
-    o3d.io.write_triangle_mesh(tmp_path, hull, write_ascii=False)
+    o3d.io.write_triangle_mesh(tmp_path, o3d_mesh, write_ascii=False)
     ply_bytes = Path(tmp_path).read_bytes()
     Path(tmp_path).unlink(missing_ok=True)
-    return ply_bytes, len(hull.triangles)
+    return ply_bytes, len(faces)
 
 
 def main() -> None:
@@ -161,28 +197,35 @@ def main() -> None:
     @app.route("/reconstruct", methods=["POST"])
     def reconstruct():
         data = request.get_json(force=True)
-        image_b64 = data.get("image_b64", "")
-        mask_b64 = data.get("mask_b64", "")
+        image_b64    = data.get("image_b64", "")
+        mask_b64     = data.get("mask_b64", "")
+        depth_b64    = data.get("depth_b64", "")
+        intrinsic    = data.get("intrinsic", None)  # [[fx,0,cx],[0,fy,cy],[0,0,1]]
         seed = int(data.get("seed", 42))
 
         if not image_b64 or not mask_b64:
             return jsonify({"error": "image_b64 and mask_b64 are required"}), 400
+        if not depth_b64 or intrinsic is None:
+            return jsonify({"error": "depth_b64 and intrinsic are required"}), 400
 
         try:
-            from PIL import Image
+            from PIL import Image as _PIL
             import numpy as np
 
-            img_bytes = base64.b64decode(image_b64)
-            pil_rgb = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            image_arr = np.array(_PIL.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB"))
+            mask_arr  = (np.array(_PIL.open(io.BytesIO(base64.b64decode(mask_b64))).convert("L")) > 127).astype(np.uint8)
 
-            mask_bytes = base64.b64decode(mask_b64)
-            mask_arr = np.array(Image.open(io.BytesIO(mask_bytes)).convert("L"))
-            mask_arr = (mask_arr > 127).astype(np.uint8)
+            depth_bytes = base64.b64decode(depth_b64)
+            depth_arr   = np.load(io.BytesIO(depth_bytes))["depth_m"].astype(np.float32)
+            K           = np.array(intrinsic, dtype=np.float32)
+            pointmap    = _depth_to_pointmap(depth_arr, K)
         except Exception as exc:
             return jsonify({"error": f"input decode failed: {exc}"}), 400
 
         try:
-            ply_bytes, n_tris = _run_inference(model, pil_rgb, mask_arr, seed=seed)
+            ply_bytes, n_tris = _run_inference(
+                model, image_arr, mask_arr, pointmap, K, seed=seed
+            )
         except Exception as exc:
             logger.exception("SAM3D inference failed")
             return jsonify({"error": f"inference failed: {exc}"}), 500

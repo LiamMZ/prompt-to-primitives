@@ -67,6 +67,7 @@ class OpenAITagger(BaseTagger):
         self,
         rgb_image: np.ndarray,
         required_tags: list[str] | None = None,
+        task: str | None = None,
     ) -> Tuple[str, str]:
         """Run the LLM on *rgb_image* and return ``(prompt_str, raw_str)``.
 
@@ -74,17 +75,19 @@ class OpenAITagger(BaseTagger):
             rgb_image: ``(H, W, 3)`` uint8 numpy array in RGB order.
             required_tags: Object names that must appear in the output (e.g. goal
                 objects from the current task).
+            task: Natural language task description. When provided, switches to the
+                task-focused prompt that limits detection to task-relevant objects
+                and their blockers rather than listing everything in the scene.
 
         Returns:
             ``(prompt_str, raw_str)`` where *prompt_str* is a period-separated label
             string suitable for GroundingDINO and *raw_str* is the raw JSON response.
         """
         prompts = self._load_prompts()
-        system_prompt = prompts.get("system_prompt", "").strip()
-        if required_tags:
-            required_str = ", ".join(f"'{t}'" for t in required_tags)
-            suffix = prompts.get("required_tags_suffix", "").strip()
-            system_prompt += "\n" + suffix.format(required_tags=required_str)
+        if task:
+            system_prompt = prompts.get("task_focused_prompt", "").strip().format(task=task)
+        else:
+            system_prompt = prompts.get("system_prompt", "").strip()
 
         img_bytes = self._encode_image(rgb_image)
         config = GenerateConfig(
