@@ -50,7 +50,15 @@ import numpy as np
 # Add it to sys.path so `from inference import Inference` works regardless of
 # where this script is invoked from.
 _here = Path(__file__).resolve().parent
-for _candidate in [_here / "notebook", _here.parent / "notebook"]:
+# Derive sam-3d-objects root from SAM3D_CKPT env var (checkpoints/hf → ../..)
+_sam3d_ckpt = os.environ.get("SAM3D_CKPT", "")
+_sam3d_home = Path(_sam3d_ckpt).parent.parent if _sam3d_ckpt else Path()
+for _candidate in [
+    _here / "notebook",
+    _here.parent / "notebook",
+    _sam3d_home / "notebook",
+    Path.home() / "installs" / "sam-3d-objects" / "notebook",
+]:
     if _candidate.exists():
         sys.path.insert(0, str(_candidate))
         break
