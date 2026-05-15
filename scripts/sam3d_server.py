@@ -97,26 +97,32 @@ def _load_model(checkpoint_dir: str, compile: bool = False):
     return model
 
 
-def _run_inference(model, pil_image, seed: int = 42) -> bytes:
+def _run_inference(model, pil_rgb, mask_arr, seed: int = 42) -> bytes:
     """Run SAM3D inference and return the mesh as binary PLY bytes."""
     import open3d as o3d
     import numpy as np
     from pathlib import Path
     import tempfile
 
-    output = model(pil_image, seed=seed)
+    image_arr = np.array(pil_rgb)
+    output = model(image_arr, mask_arr, seed=seed)
 
     gs = output.get("gs")
     if gs is None:
         raise ValueError("SAM3D output missing 'gs' key")
 
-    # Convert Gaussian splat to convex-hull mesh for collision use.
-    if isinstance(gs, (str, Path)):
-        pcd = o3d.io.read_point_cloud(str(gs))
-    else:
-        pts = np.asarray(gs.get_xyz().cpu())
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(pts)
+    # Save the Gaussian splat to a temp PLY, then read back as a point cloud.
+    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as f:
+        gs_ply_path = f.name
+    try:
+        if isinstance(gs, (str, Path)):
+            gs_ply_path = str(gs)
+        else:
+            gs.save_ply(gs_ply_path)
+        pcd = o3d.io.read_point_cloud(gs_ply_path)
+    finally:
+        if not isinstance(gs, (str, Path)):
+            Path(gs_ply_path).unlink(missing_ok=True)
 
     if len(pcd.points) < 4:
         raise ValueError(f"Point cloud too sparse: {len(pcd.points)} points")
@@ -171,16 +177,12 @@ def main() -> None:
 
             mask_bytes = base64.b64decode(mask_b64)
             mask_arr = np.array(Image.open(io.BytesIO(mask_bytes)).convert("L"))
-            alpha = (mask_arr > 127).astype(np.uint8) * 255
-
-            # Embed mask as alpha channel — SAM3D expects RGBA with alpha = object mask.
-            rgba = np.dstack([np.array(pil_rgb), alpha])
-            pil_rgba = Image.fromarray(rgba, mode="RGBA")
+            mask_arr = (mask_arr > 127).astype(np.uint8)
         except Exception as exc:
             return jsonify({"error": f"input decode failed: {exc}"}), 400
 
         try:
-            ply_bytes, n_tris = _run_inference(model, pil_rgba, seed=seed)
+            ply_bytes, n_tris = _run_inference(model, pil_rgb, mask_arr, seed=seed)
         except Exception as exc:
             logger.exception("SAM3D inference failed")
             return jsonify({"error": f"inference failed: {exc}"}), 500

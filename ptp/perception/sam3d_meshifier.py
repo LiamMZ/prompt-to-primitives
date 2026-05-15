@@ -179,11 +179,7 @@ class Sam3DMeshifier:
     ) -> Optional[object]:
         from PIL import Image as _PIL
 
-        alpha = (mask.astype(np.uint8) * 255)
-        rgba = np.dstack([color_rgb, alpha])
-        pil_image = _PIL.fromarray(rgba, mode="RGBA")
-
-        output = self._inference(pil_image, seed=seed)
+        output = self._inference(color_rgb.astype(np.uint8), mask.astype(np.uint8), seed=seed)
         return self._output_to_open3d(output)
 
     def _output_to_open3d(self, output: dict) -> Optional[object]:
@@ -193,15 +189,17 @@ class Sam3DMeshifier:
         if gs is None:
             return None
 
+        import tempfile
         if isinstance(gs, (str, Path)):
             pcd = o3d.io.read_point_cloud(str(gs))
         else:
+            with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as f:
+                gs_ply_path = f.name
             try:
-                pts = np.asarray(gs.get_xyz().cpu())
-                pcd = o3d.geometry.PointCloud()
-                pcd.points = o3d.utility.Vector3dVector(pts)
-            except Exception:
-                return None
+                gs.save_ply(gs_ply_path)
+                pcd = o3d.io.read_point_cloud(gs_ply_path)
+            finally:
+                Path(gs_ply_path).unlink(missing_ok=True)
 
         if len(pcd.points) < 4:
             return None
