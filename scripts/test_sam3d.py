@@ -244,10 +244,12 @@ def load_into_pybullet(meshes_positioned: dict) -> None:
         if len(col_verts) == 0 or len(col_tris) == 0:
             col_verts, col_tris = verts, tris
 
-        # Visual: write full mesh to a temp .obj so PyBullet loads it from file.
+        # Visual: decimate + write to temp .obj (PyBullet inline has vertex limits).
+        vis_mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=3000)
+        vis_mesh.remove_degenerate_triangles()
         tmp = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
         tmp.close()
-        o3d.io.write_triangle_mesh(tmp.name, mesh)
+        o3d.io.write_triangle_mesh(tmp.name, vis_mesh)
         tmp_files.append(tmp.name)
 
         r, g, b, a = _PALETTE[i % len(_PALETTE)]
@@ -264,11 +266,12 @@ def load_into_pybullet(meshes_positioned: dict) -> None:
             physicsClientId=client,
         )
         centroid = verts.mean(axis=0).tolist()
+        # Mesh vertices are already in world frame — body origin at [0,0,0].
         p.createMultiBody(
             baseMass=0,
             baseCollisionShapeIndex=col,
             baseVisualShapeIndex=vis,
-            basePosition=centroid,
+            basePosition=[0, 0, 0],
             baseOrientation=[0, 0, 0, 1],
             physicsClientId=client,
         )
