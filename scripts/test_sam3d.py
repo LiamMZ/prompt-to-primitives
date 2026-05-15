@@ -42,8 +42,9 @@ _PALETTE = [
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Test SAM3D end-to-end with PyBullet")
     p.add_argument("--server",
-                   default=os.environ.get("SAM3D_SERVER", "http://192.168.0.88:8766"),
-                   help="SAM3D server URL (default: $SAM3D_SERVER)")
+                   default=os.environ.get("SAM3D_SERVERS",
+                           os.environ.get("SAM3D_SERVER", "http://192.168.0.88:8766")),
+                   help="Comma-separated SAM3D server URLs (default: $SAM3D_SERVERS or $SAM3D_SERVER)")
     p.add_argument("--synthetic", action="store_true",
                    help="Use a synthetic image + centre-crop mask (no camera needed)")
     p.add_argument("--no-viz", action="store_true",
@@ -270,14 +271,17 @@ def main() -> None:
     import numpy as np
     from ptp.perception.sam3d_meshifier import Sam3DMeshifier
 
+    server_urls = args.server.split(",")
+    logger.info("Health-checking %d server(s): %s", len(server_urls), server_urls)
+    for url in server_urls:
+        try:
+            Sam3DMeshifier(server_url=url).load()
+            logger.info("  %s — OK", url)
+        except RuntimeError as e:
+            logger.error("  %s — FAILED: %s", url, e)
+            sys.exit(1)
+
     meshifier = Sam3DMeshifier(server_url=args.server)
-    logger.info("Health-checking %s …", args.server)
-    try:
-        meshifier.load()
-    except RuntimeError as e:
-        logger.error("%s", e)
-        sys.exit(1)
-    logger.info("Server is up.")
 
     if args.synthetic:
         color, depth, intrinsics, masks = make_synthetic()

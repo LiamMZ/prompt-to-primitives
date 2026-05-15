@@ -27,8 +27,9 @@ import base64
 import io
 import logging
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -38,17 +39,17 @@ logger = logging.getLogger(__name__)
 class Sam3DMeshifier:
     """Reconstruct per-object 3D meshes using SAM 3D Objects.
 
-    Pass either ``checkpoint_dir`` (local inference) or ``server_url`` (remote
-    server started with ``scripts/sam3d_server.py``).  If both are given,
-    ``server_url`` takes precedence.
+    Pass either ``checkpoint_dir`` (local inference) or one or more
+    ``server_url`` values (remote servers started with
+    ``scripts/sam3d_server.py``).  Multiple URLs enable parallel
+    reconstruction — one object per server at a time.
 
     Args:
-        checkpoint_dir: Path to the SAM3D checkpoint directory containing
-            ``pipeline.yaml`` (local mode only).
-        server_url: Base URL of a running sam3d_server, e.g.
-            ``"http://127.0.0.1:8766"`` or a HuggingFace Space URL.
-        compile: torch.compile the model for faster inference (local mode,
-            slower first call).
+        checkpoint_dir: Path to the SAM3D checkpoint directory (local mode).
+        server_url: Single server URL, or comma-separated list of URLs.
+            e.g. ``"http://host:8766"`` or
+            ``"http://host:8766,http://host:8767"``.
+        compile: torch.compile the model (local mode, slower first call).
     """
 
     def __init__(
@@ -57,14 +58,21 @@ class Sam3DMeshifier:
         server_url: Optional[str] = None,
         compile: bool = False,
     ) -> None:
-        self._server_url = server_url.rstrip("/") if server_url else None
+        if server_url:
+            self._server_urls: List[str] = [u.rstrip("/") for u in server_url.split(",")]
+        else:
+            self._server_urls = []
         self._checkpoint_dir = Path(checkpoint_dir)
         self._compile = compile
         self._inference = None  # local model, lazy-loaded
 
     @property
     def is_remote(self) -> bool:
-        return self._server_url is not None
+        return bool(self._server_urls)
+
+    @property
+    def _server_url(self) -> Optional[str]:
+        return self._server_urls[0] if self._server_urls else None
 
     # ------------------------------------------------------------------
     # Public API
@@ -127,15 +135,44 @@ class Sam3DMeshifier:
     ) -> Dict[str, Optional[object]]:
         """Reconstruct meshes for all objects in ``masks``.
 
+        When multiple server URLs are configured, objects are distributed
+        across servers and reconstructed in parallel.
+
         Returns a dict mapping object_id → mesh (or None on per-object failure).
         """
-        results: Dict[str, Optional[object]] = {}
-        for obj_id, mask in masks.items():
+        items = list(masks.items())
+        n_servers = len(self._server_urls)
+
+        if n_servers <= 1:
+            # Single server or local — sequential
+            results: Dict[str, Optional[object]] = {}
+            for obj_id, mask in items:
+                try:
+                    results[obj_id] = self._reconstruct_one(color_rgb, mask, T_base_cam, seed)
+                except Exception as exc:
+                    logger.warning("SAM3D reconstruction failed for %r: %s", obj_id, exc)
+                    results[obj_id] = None
+            return results
+
+        # Multiple servers — parallel, round-robin assignment
+        def _worker(obj_id: str, mask: np.ndarray, server_idx: int):
+            url = self._server_urls[server_idx % n_servers]
+            meshifier = Sam3DMeshifier(server_url=url)
             try:
-                results[obj_id] = self._reconstruct_one(color_rgb, mask, T_base_cam, seed)
+                return obj_id, meshifier._reconstruct_one(color_rgb, mask, T_base_cam, seed)
             except Exception as exc:
-                logger.warning("SAM3D reconstruction failed for %r: %s", obj_id, exc)
-                results[obj_id] = None
+                logger.warning("SAM3D reconstruction failed for %r on %s: %s", obj_id, url, exc)
+                return obj_id, None
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=n_servers) as ex:
+            futures = {
+                ex.submit(_worker, obj_id, mask, i): obj_id
+                for i, (obj_id, mask) in enumerate(items)
+            }
+            for future in as_completed(futures):
+                obj_id, mesh = future.result()
+                results[obj_id] = mesh
         return results
 
     # ------------------------------------------------------------------
