@@ -118,6 +118,8 @@ class DepthEnvironmentCollider:
         # When set, only these object IDs are sent to SAM3D; others use depth Poisson.
         # None means all objects are eligible.
         self._sam3d_ids: Optional[Set[str]] = None
+        # object_id -> Open3D mesh, populated after each rebuild for SAM3D objects.
+        self._object_meshes: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -130,6 +132,18 @@ class DepthEnvironmentCollider:
         Pass None to make all objects eligible (default).
         """
         self._sam3d_ids = set(object_ids) if object_ids is not None else None
+
+    def get_object_points(self, object_id: str) -> Optional[np.ndarray]:
+        """Return (N, 3) world-frame vertices for an object's mesh, or None.
+
+        Populated for objects that were reconstructed via SAM3D.  Use this to
+        pass real geometry to GraspPlanner for antipodal jaw placement.
+        """
+        mesh = self._object_meshes.get(object_id)
+        if mesh is None:
+            return None
+        verts = np.asarray(mesh.vertices, dtype=np.float64)
+        return verts if len(verts) >= 4 else None
 
     @property
     def object_ids(self) -> list[str]:
@@ -284,6 +298,7 @@ class DepthEnvironmentCollider:
                     p.removeBody(body_id, physicsClientId=client)
                 except Exception:
                     pass
+            self._object_meshes.pop(lbl, None)
 
     def __del__(self) -> None:
         try:
@@ -697,6 +712,7 @@ class DepthEnvironmentCollider:
         if body_id is None:
             return False
         self._bodies[label] = body_id
+        self._object_meshes[label] = mesh  # retain for grasp planning
         logger.info(
             "DepthEnvironmentCollider: [%s] (SAM3D) body=%d  triangles=%d",
             label, body_id, len(np.asarray(mesh.triangles)),
@@ -859,17 +875,41 @@ class DepthEnvironmentCollider:
     _BACKGROUND_COLOUR = (0.7, 0.7, 0.7, 0.35)
     _label_counter: int = 0
 
+    # PyBullet inline GEOM_MESH limit is ~65k vertices; decimate to stay well under.
+    _PB_MAX_COL_TRIS = 500
+    _PB_MAX_VIS_TRIS = 3000
+
     def _mesh_to_pybullet(self, mesh, label: str = "") -> Optional[int]:
-        verts = np.asarray(mesh.vertices, dtype=np.float64)
-        tris = np.asarray(mesh.triangles, dtype=np.int32)
-        if len(verts) == 0 or len(tris) == 0:
+        if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
             return None
+
+        # Collision mesh: heavily decimated so PyBullet accepts it inline.
+        col_mesh = mesh.simplify_quadric_decimation(
+            target_number_of_triangles=self._PB_MAX_COL_TRIS
+        )
+        col_mesh.remove_degenerate_triangles()
+        col_verts = np.asarray(col_mesh.vertices, dtype=np.float64)
+        col_tris = np.asarray(col_mesh.triangles, dtype=np.int32)
+        if len(col_verts) == 0 or len(col_tris) == 0:
+            col_verts = np.asarray(mesh.vertices, dtype=np.float64)
+            col_tris = np.asarray(mesh.triangles, dtype=np.int32)
+
+        # Visual mesh: moderately decimated for display.
+        vis_mesh = mesh.simplify_quadric_decimation(
+            target_number_of_triangles=self._PB_MAX_VIS_TRIS
+        )
+        vis_mesh.remove_degenerate_triangles()
+        vis_verts = np.asarray(vis_mesh.vertices, dtype=np.float64)
+        vis_tris = np.asarray(vis_mesh.triangles, dtype=np.int32)
+        if len(vis_verts) == 0 or len(vis_tris) == 0:
+            vis_verts, vis_tris = col_verts, col_tris
+
         client = self._planner._physics_client
         try:
             col_id = p.createCollisionShape(
                 p.GEOM_MESH,
-                vertices=verts.tolist(),
-                indices=tris.flatten().tolist(),
+                vertices=col_verts.tolist(),
+                indices=col_tris.flatten().tolist(),
                 physicsClientId=client,
             )
             if label == BACKGROUND_ID:
@@ -879,8 +919,8 @@ class DepthEnvironmentCollider:
                 self._label_counter += 1
             vis_id = p.createVisualShape(
                 p.GEOM_MESH,
-                vertices=verts.tolist(),
-                indices=tris.flatten().tolist(),
+                vertices=vis_verts.tolist(),
+                indices=vis_tris.flatten().tolist(),
                 rgbaColor=rgba,
                 physicsClientId=client,
             )

@@ -363,9 +363,22 @@ class XArmPybulletPlannedPrimitives:
                 "Default orientation failed — running antipodal grasp sampler (seed=%s)", seed_name
             )
             clearance_profile = _kwargs.get("clearance_profile", None)
+
+            # Use SAM3D mesh vertices for antipodal jaw placement if available.
+            object_points = None
+            if target_object_id is not None and hasattr(self, "_depth_collider") \
+                    and self._depth_collider is not None:
+                object_points = self._depth_collider.get_object_points(target_object_id)
+                if object_points is not None:
+                    self._logger.info(
+                        "GraspPlanner: using SAM3D mesh (%d pts) for %s",
+                        len(object_points), target_object_id,
+                    )
+
             from ptp.grasp.grasp_planner import GraspPlanner
             candidate = GraspPlanner(self._planner).plan(
                 np.asarray(pos),
+                object_points=object_points,
                 seed_orientation=seed_name,
                 clearance_profile=clearance_profile,
                 ignore_labels=ignore_labels,

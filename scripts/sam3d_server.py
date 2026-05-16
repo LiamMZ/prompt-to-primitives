@@ -107,13 +107,37 @@ def _load_model(checkpoint_dir: str, compile: bool = False):
     return model
 
 
+def _inpaint_depth(depth: np.ndarray) -> np.ndarray:
+    """Fill zero/invalid depth pixels with the nearest valid neighbour.
+
+    SAM3D's optimizer requires a dense, finite pointmap.  Holes (depth == 0)
+    produce [0,0,0] entries that make the initial residuals non-finite and
+    crash the solver.  We propagate valid readings outward via repeated dilation
+    so that every pixel has a plausible depth value.
+    """
+    from scipy.ndimage import distance_transform_edt
+    depth = depth.astype(np.float32)
+    valid = depth > 0
+    if valid.all():
+        return depth
+    if not valid.any():
+        # No valid readings at all — fill with a nominal 1 m.
+        depth[:] = 1.0
+        return depth
+    # For each invalid pixel, copy the value of its nearest valid pixel.
+    _, nearest_idx = distance_transform_edt(~valid, return_indices=True)
+    filled = depth[nearest_idx[0], nearest_idx[1]]
+    return filled
+
+
 def _depth_to_pointmap(depth: np.ndarray, K: np.ndarray) -> np.ndarray:
     """Back-project depth to a SAM3D-convention pointmap [-x, -y, z] (H, W, 3)."""
+    depth = _inpaint_depth(depth)
     H, W = depth.shape
     u = np.arange(W)[None, :].repeat(H, axis=0).astype(np.float32)
     v = np.arange(H)[:, None].repeat(W, axis=1).astype(np.float32)
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-    z = depth.astype(np.float32)
+    z = depth
     x = (u - cx) / fx * z
     y = (v - cy) / fy * z
     return np.stack([-x, -y, z], axis=-1)
